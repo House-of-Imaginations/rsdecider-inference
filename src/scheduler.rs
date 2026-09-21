@@ -3,7 +3,7 @@ use crate::cache::{Cache, Key};
 use crate::model::postprocess::Raw;
 use crate::model::sequence::Encoded;
 use futures::future::{FutureExt, Shared, WeakShared};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
@@ -74,6 +74,8 @@ pub struct WorkItem {
     deadline: Arc<Mutex<Instant>>,
     map: Map,
     _permit: OwnedSemaphorePermit,
+    /// `enc.ids.len()` is counted in `queued` (by `admit`) until this item drops.
+    queued: Arc<AtomicUsize>,
 }
 
 impl WorkItem {
@@ -89,6 +91,7 @@ impl WorkItem {
 
 impl Drop for WorkItem {
     fn drop(&mut self) {
+        self.queued.fetch_sub(self.enc.ids.len(), Ordering::Relaxed);
         let mut map = self.map.lock().unwrap();
         if map.get(&self.key).is_some_and(|e| e.generation == self.generation) {
             map.remove(&self.key);
@@ -103,8 +106,10 @@ struct ModelQueue {
     tx: mpsc::UnboundedSender<WorkItem>,
     workers: usize,
     live: Arc<AtomicUsize>,
-    /// EMA of inference seconds per item, as f64 bits; 0.0 = no estimate yet.
-    secs_per_item: Arc<AtomicU64>,
+    /// EMA of inference seconds per real token (absorbs average padding), as f64 bits; 0.0 = no estimate yet.
+    secs_per_token: Arc<AtomicU64>,
+    /// Tokens of admitted items not yet finished or dropped (queued or in a running batch).
+    queued_tokens: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -129,7 +134,7 @@ impl Scheduler {
             let (ready_tx, ready_rx) = std_mpsc::channel();
             let idle = Arc::new(Semaphore::new(spec.workers));
             let live = Arc::new(AtomicUsize::new(spec.workers));
-            let secs_per_item = Arc::new(AtomicU64::new(0));
+            let secs_per_token = Arc::new(AtomicU64::new(0));
             for w in 0..spec.workers {
                 let ctx = WorkerCtx {
                     name: spec.name.clone(),
@@ -142,7 +147,7 @@ impl Scheduler {
                     max_pending: spec.max_pending,
                     idle: idle.clone(),
                     live: live.clone(),
-                    secs_per_item: secs_per_item.clone(),
+                    secs_per_token: secs_per_token.clone(),
                 };
                 let ready = ready_tx.clone();
                 std::thread::Builder::new()
@@ -162,7 +167,8 @@ impl Scheduler {
                 tx,
                 workers: spec.workers,
                 live,
-                secs_per_item,
+                secs_per_token,
+                queued_tokens: Arc::default(),
             });
         }
         Ok(Self { map, models: Arc::new(models), next_gen: Arc::default() })
@@ -236,13 +242,14 @@ impl Scheduler {
                     continue;
                 }
                 let q = &self.models[m];
-                // Shed now if the work already queued ahead cannot drain before the deadline (fast 529,
-                // not a late 504). Only work ahead counts: an idle queue always admits, so a stale high
+                // Shed now if the work already queued ahead plus this request cannot finish before the
+                // deadline (fast 529, not a late 504). An idle queue always admits, so a stale high
                 // estimate can't shed large requests forever.
-                let spi = f64::from_bits(q.secs_per_item.load(Ordering::Relaxed));
-                let ahead = q.max_pending - q.permits.available_permits();
+                let spt = f64::from_bits(q.secs_per_token.load(Ordering::Relaxed));
+                let ahead = q.queued_tokens.load(Ordering::Relaxed);
+                let own: usize = fresh.iter().filter(|j| j.model == m).map(|j| j.enc.ids.len()).sum();
                 let left = deadline.saturating_duration_since(Instant::now()).as_secs_f64();
-                if spi > 0.0 && ahead > 0 && ahead as f64 * spi / q.workers as f64 > left {
+                if spt > 0.0 && ahead > 0 && (ahead + own) as f64 * spt / q.workers as f64 > left {
                     metrics::counter!("rsdecider_shed_total", "model" => q.name.clone()).increment(1);
                     return Err(SchedError::Overloaded);
                 }
@@ -263,6 +270,8 @@ impl Scheduler {
                 let dl = Arc::new(Mutex::new(deadline));
                 let weak = shared.downgrade().expect("fresh future is pending");
                 map.insert(job.key, Entry { generation, weak, deadline: dl.clone() });
+                // Counted inside the lock so the next admit sees it; this job's WorkItem subtracts it on drop.
+                self.models[job.model].queued_tokens.fetch_add(job.enc.ids.len(), Ordering::Relaxed);
                 let permit = permits[job.model].as_mut().unwrap().split(1).unwrap();
                 parts.push((job.clone(), generation, tx, dl, permit));
                 subs.push((job.key, shared));
@@ -270,6 +279,7 @@ impl Scheduler {
         }
         // Lock released: build WorkItems and enqueue, with no await in between.
         for (job, generation, tx, deadline, permit) in parts {
+            let q = &self.models[job.model];
             let item = WorkItem {
                 key: job.key,
                 generation,
@@ -278,10 +288,11 @@ impl Scheduler {
                 deadline,
                 map: self.map.clone(),
                 _permit: permit,
+                queued: q.queued_tokens.clone(),
             };
             // A send error means the batcher is gone (shutdown, or every worker retired): fail
             // subscribers now instead of letting them re-admit until the deadline.
-            if let Err(mpsc::error::SendError(mut item)) = self.models[job.model].tx.send(item) {
+            if let Err(mpsc::error::SendError(mut item)) = q.tx.send(item) {
                 item.finish(Err("model workers unavailable".into()));
             }
         }
@@ -289,51 +300,72 @@ impl Scheduler {
     }
 }
 
-/// Step 6: collect up to max items / max tokens / max wait, but only once a worker is idle, so
-/// surplus work stays in the queue where it can still be skipped.
+/// Step 6: once a worker is idle, collect up to max items / max wait (plus everything already queued),
+/// then dispatch the oldest item with the buffered items closest to its length (less padding).
+/// Surplus work stays buffered where it can still be skipped.
 async fn batcher(
     mut rx: mpsc::UnboundedReceiver<WorkItem>,
     (max_items, max_tokens, max_wait): (usize, usize, Duration),
     idle: Arc<Semaphore>,
     work: std_mpsc::SyncSender<Dispatch>,
 ) {
-    let mut carry: Option<WorkItem> = None;
+    // Bounded by `max_pending`: every buffered item holds a permit.
+    let mut buf: VecDeque<WorkItem> = VecDeque::new();
     loop {
         let Ok(idle_permit) = idle.clone().acquire_owned().await else { return };
-        let first = match carry.take() {
-            Some(i) => i,
-            None => match rx.recv().await {
-                Some(i) => i,
+        if buf.is_empty() {
+            match rx.recv().await {
+                Some(i) => buf.push_back(i),
                 None => return,
-            },
-        };
-        // ORT allocates batch × longest, so the cap applies to the padded size
-        let mut longest = first.enc.ids.len();
-        let mut batch = vec![first];
+            }
+        }
         let close = Instant::now() + max_wait;
-        while batch.len() < max_items {
+        // Stop early once real tokens already reach the cap (padded is only larger). The sum may
+        // include items that later `retain` drops as dead, which only stops collection sooner: harmless.
+        while buf.len() < max_items && buf.iter().map(|i| i.enc.ids.len()).sum::<usize>() < max_tokens {
             let Ok(Some(item)) = tokio::time::timeout_at(close, rx.recv()).await else { break };
-            if !item.live(Instant::now()) {
-                continue; // dropped here: entry removed, permit released
-            }
-            let len = longest.max(item.enc.ids.len());
-            if (batch.len() + 1) * len > max_tokens {
-                carry = Some(item);
-                break;
-            }
-            longest = len;
-            batch.push(item);
+            buf.push_back(item);
+        }
+        while let Ok(item) = rx.try_recv() {
+            buf.push_back(item); // everything already queued is a candidate
         }
         let now = Instant::now();
-        batch.retain(|i| i.live(now));
-        if batch.is_empty() {
-            continue;
-        }
+        buf.retain(|i| i.live(now)); // dropped here: entry removed, permit released
+        let Some(first) = buf.pop_front() else { continue };
+        let batch = pick(first, &mut buf, max_items, max_tokens);
         // Never blocks: at most `workers` idle permits exist and the channel holds `workers`.
         if work.send((batch, idle_permit)).is_err() {
             return;
         }
     }
+}
+
+/// The oldest item, then buffered items in arrival order, skipping any more than 2× off its length,
+/// under the padded-token cap (ORT allocates batch × longest). Arrival order keeps a request's
+/// questions together; sorting by closeness let newer same-type questions overtake them (late 504s).
+fn pick(first: WorkItem, buf: &mut VecDeque<WorkItem>, max_items: usize, max_tokens: usize) -> Vec<WorkItem> {
+    let target = first.enc.ids.len();
+    let (mut longest, mut chosen) = (target, Vec::new());
+    for (i, item) in buf.iter().enumerate() {
+        if chosen.len() + 1 >= max_items {
+            break;
+        }
+        let n = item.enc.ids.len();
+        if n.max(target) > 2 * n.min(target) {
+            continue; // waits for a batch of its own length (it leads one once it is the oldest)
+        }
+        let len = longest.max(n);
+        if (chosen.len() + 2) * len <= max_tokens {
+            longest = len;
+            chosen.push(i);
+        }
+    }
+    // Highest index first, so earlier removals don't shift the ones still to come.
+    chosen.sort_unstable_by(|a, b| b.cmp(a));
+    let mut batch = vec![first];
+    batch.extend(chosen.into_iter().map(|i| buf.remove(i).expect("index in range")));
+    batch[1..].reverse(); // back to arrival order
+    batch
 }
 
 struct WorkerCtx {
@@ -347,7 +379,7 @@ struct WorkerCtx {
     max_pending: usize,
     idle: Arc<Semaphore>,
     live: Arc<AtomicUsize>,
-    secs_per_item: Arc<AtomicU64>,
+    secs_per_token: Arc<AtomicU64>,
 }
 
 fn worker(ctx: WorkerCtx, ready: std_mpsc::Sender<Result<(), String>>) {
@@ -373,8 +405,14 @@ fn worker(ctx: WorkerCtx, ready: std_mpsc::Sender<Result<(), String>>) {
         let mut panicked = false;
         let failure = match result {
             Ok(Ok(raws)) if raws.len() == items.len() => {
-                let x = batch_secs / items.len() as f64;
-                let _ = ctx.secs_per_item.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+                let real_tokens = items.iter().map(|i| i.enc.ids.len()).sum::<usize>();
+                let longest = items.iter().map(|i| i.enc.ids.len()).max().unwrap_or(0);
+                metrics::counter!("rsdecider_real_tokens_total", "model" => ctx.name.clone())
+                    .increment(real_tokens as u64);
+                metrics::counter!("rsdecider_padded_tokens_total", "model" => ctx.name.clone())
+                    .increment((items.len() * longest) as u64);
+                let x = batch_secs / real_tokens.max(1) as f64;
+                let _ = ctx.secs_per_token.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
                     let old = f64::from_bits(b);
                     Some(if old == 0.0 { x } else { 0.8 * old + 0.2 * x }.to_bits())
                 });
@@ -461,6 +499,17 @@ mod tests {
         Instant::now() + Duration::from_secs(n)
     }
 
+    /// Polls `cond` every millisecond, failing the test after 2 s.
+    async fn wait_until(cond: impl Fn() -> bool) {
+        for _ in 0..2000 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("condition not met within 2 s");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn identical_concurrent_jobs_run_once() {
         let fake = Fake { delay: Duration::from_millis(50), ..Fake::default() };
@@ -485,7 +534,7 @@ mod tests {
             let s = s.clone();
             tokio::spawn(async move { s.run_jobs(vec![job(9, 1, 4)], secs(5)).await })
         };
-        tokio::time::sleep(Duration::from_millis(20)).await; // model b: 1 of 2 permits used
+        wait_until(|| s.map.lock().unwrap().contains_key(&[9; 32])).await; // model b: 1 of 2 permits used
         let r = s.run_jobs(vec![job(1, 0, 4), job(2, 1, 4), job(3, 1, 4)], secs(5)).await;
         assert_eq!(r.unwrap_err(), SchedError::Overloaded);
         assert_eq!(s.models[0].permits.available_permits(), 4, "model a permits returned");
@@ -566,6 +615,62 @@ mod tests {
         assert_eq!(*fake.batch_sizes.lock().unwrap(), [1, 1]);
     }
 
+    fn item(len: usize) -> WorkItem {
+        let (tx, _) = oneshot::channel();
+        WorkItem {
+            key: [0; 32],
+            generation: 0,
+            enc: job(1, 0, len).enc,
+            tx: Some(tx),
+            deadline: Arc::new(Mutex::new(Instant::now())),
+            map: Arc::default(),
+            _permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            queued: Arc::default(),
+        }
+    }
+
+    fn lens<'a>(items: impl IntoIterator<Item = &'a WorkItem>) -> Vec<usize> {
+        items.into_iter().map(|i| i.enc.ids.len()).collect()
+    }
+
+    #[test]
+    fn pick_groups_similar_lengths_oldest_first() {
+        let mut buf: VecDeque<WorkItem> = [500, 12, 480, 11, 490].into_iter().map(item).collect();
+        let batch = pick(item(10), &mut buf, 3, 8192);
+        assert_eq!(lens(&batch), [10, 12, 11], "the oldest leads, then similar lengths in arrival order");
+        assert_eq!(lens(&buf), [500, 480, 490], "the rest stay buffered in arrival order");
+        let batch = pick(buf.pop_front().unwrap(), &mut buf, 3, 8192);
+        assert_eq!(lens(&batch), [500, 480, 490]);
+    }
+
+    #[test]
+    fn pick_keeps_arrival_order_within_2x() {
+        // 14 is within 2× of 10, so it goes before the newer, closer 10s (a request's siblings stay together).
+        let mut buf: VecDeque<WorkItem> = [14, 10, 10].into_iter().map(item).collect();
+        assert_eq!(lens(&pick(item(10), &mut buf, 2, 8192)), [10, 14]);
+        assert_eq!(lens(&buf), [10, 10]);
+    }
+
+    #[test]
+    fn pick_respects_the_padded_token_cap() {
+        let mut buf: VecDeque<WorkItem> = [12, 11].into_iter().map(item).collect();
+        // 10 + 12 pad to 2 × 12 = 24 <= 30; adding 11 would pad to 3 × 12 = 36.
+        assert_eq!(lens(&pick(item(10), &mut buf, 8, 30)), [10, 12]);
+        assert_eq!(lens(&buf), [11]);
+    }
+
+    #[test]
+    fn pick_with_one_item_cap_returns_only_the_first() {
+        let mut buf: VecDeque<WorkItem> = [11, 12].into_iter().map(item).collect();
+        assert_eq!(lens(&pick(item(10), &mut buf, 1, 8192)), [10]);
+        assert_eq!(lens(&buf), [11, 12]);
+    }
+
+    #[test]
+    fn pick_from_an_empty_buffer_returns_only_the_first() {
+        assert_eq!(lens(&pick(item(10), &mut VecDeque::new(), 8, 8192)), [10]);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn abandoned_items_are_skipped() {
         let fake = Fake { delay: Duration::from_millis(100), ..Fake::default() };
@@ -620,12 +725,49 @@ mod tests {
             let s = s.clone();
             tokio::spawn(async move { s.run_jobs((2..7).map(|n| job(n, 0, 4)).collect(), secs(5)).await })
         };
-        tokio::time::sleep(Duration::from_millis(20)).await; // 5 items queued: ~0.5 s of work
+        wait_until(|| s.map.lock().unwrap().contains_key(&[2; 32])).await; // 5 items queued: ~0.5 s of work
         let started = Instant::now();
         let r = s.run_jobs(vec![job(9, 0, 4)], Instant::now() + Duration::from_millis(300)).await;
         assert_eq!(r.unwrap_err(), SchedError::Overloaded);
         assert!(started.elapsed() < Duration::from_millis(50), "shed at admission, not at the deadline");
         busy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn own_work_counts_toward_the_deadline() {
+        let fake = Fake { delay: Duration::from_millis(100), ..Fake::default() };
+        let s = sched(vec![spec("m", &fake, 64, 1, 8192)]).await;
+        s.run_jobs(vec![job(1, 0, 4)], secs(5)).await.unwrap(); // seeds the estimate: ~0.1 s per 4 tokens
+        let busy = {
+            let s = s.clone();
+            tokio::spawn(async move { s.run_jobs(vec![job(2, 0, 4)], secs(5)).await })
+        };
+        wait_until(|| s.map.lock().unwrap().contains_key(&[2; 32])).await; // 1 item ahead: ~0.1 s
+        let started = Instant::now();
+        // Ahead alone fits 300 ms; ahead plus these 5 items (~0.6 s) does not.
+        let r = s.run_jobs((3..8).map(|n| job(n, 0, 4)).collect(), Instant::now() + Duration::from_millis(300)).await;
+        assert_eq!(r.unwrap_err(), SchedError::Overloaded);
+        assert!(started.elapsed() < Duration::from_millis(50), "shed at admission, not at the deadline");
+        busy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_tokens_return_to_zero() {
+        let fake = Fake { delay: Duration::from_millis(400), ..Fake::default() };
+        let s = sched(vec![spec("m", &fake, 64, 1, 8192)]).await;
+        s.run_jobs(vec![job(1, 0, 400)], secs(5)).await.unwrap(); // success; low estimate: 1 ms/token
+        let busy = {
+            let s = s.clone();
+            tokio::spawn(async move { s.run_jobs(vec![job(2, 0, 4)], secs(5)).await })
+        };
+        wait_until(|| s.map.lock().unwrap().contains_key(&[2; 32])).await;
+        let r = s.run_jobs(vec![job(3, 0, 4)], Instant::now() + Duration::from_millis(50)).await;
+        assert_eq!(r.unwrap_err(), SchedError::Deadline, "admitted, then stuck behind the busy batch");
+        let r = s.run_jobs((4..9).map(|n| job(n, 0, 400)).collect(), Instant::now() + Duration::from_millis(300)).await;
+        assert_eq!(r.unwrap_err(), SchedError::Overloaded);
+        busy.await.unwrap().unwrap();
+        // The dead item is dropped once the worker frees.
+        wait_until(|| s.models[0].queued_tokens.load(Ordering::Relaxed) == 0 && s.map.lock().unwrap().is_empty()).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -664,6 +806,7 @@ mod tests {
             deadline: dl,
             map: map.clone(),
             _permit: permit,
+            queued: Arc::default(),
         };
         drop(old);
         assert!(map.lock().unwrap().contains_key(&[1; 32]));

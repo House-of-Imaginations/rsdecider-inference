@@ -20,7 +20,7 @@ for s in cold hot mixed batch overload tokenize; do
   echo "## $s ($(rate "$s") req/s)" >> "$out"
   k6 run --quiet -e SCENARIO="$s" -e RATE="$(rate "$s")" --summary-trend-stats "avg,p(50),p(95),p(99),max" scenario.js 2>&1 \
     | grep -E 'http_req_duration|http_reqs|http_req_failed|checks|dropped_iterations' | sed 's/^/    /' >> "$out" || echo "    (thresholds failed)" >> "$out"
-  curl -s "${RSD_METRICS:-http://127.0.0.1:9000}/metrics" | grep -E '^rsdecider_(batch_size|pending|cache_total|shed_total|tokenize_shed_total|coalesced_total)' \
+  curl -s "${RSD_METRICS:-http://127.0.0.1:9000}/metrics" | grep -E '^rsdecider_(batch_size|pending|cache_total|shed_total|tokenize_shed_total|coalesced_total|padded_tokens_total|real_tokens_total)' \
     | sed 's/^/    /' >> "$out" || true
   echo >> "$out"
 done

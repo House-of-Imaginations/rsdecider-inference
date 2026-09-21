@@ -1,0 +1,224 @@
+{
+  "title": "rsdecider",
+  "uid": "rsdecider",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "timezone": "browser",
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "10s",
+  "templating": {
+    "list": [
+      {
+        "name": "model",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": { "query": "label_values(rsdecider_pending, model)", "refId": "model" },
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Requests/s by status",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(rsdecider_requests_total[$__rate_interval]))",
+          "legendFormat": "{{status}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+    },
+    {
+      "id": 2,
+      "title": "Request latency p50/p95/p99",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "rsdecider_request_seconds{quantile=\"0.5\"}", "legendFormat": "p50", "refId": "A" },
+        { "expr": "rsdecider_request_seconds{quantile=\"0.95\"}", "legendFormat": "p95", "refId": "B" },
+        { "expr": "rsdecider_request_seconds{quantile=\"0.99\"}", "legendFormat": "p99", "refId": "C" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "id": 3,
+      "title": "Sheds/s",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(rsdecider_shed_total{model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "shed {{model}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(rsdecider_tokenize_shed_total[$__rate_interval]))",
+          "legendFormat": "tokenize shed",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+    },
+    {
+      "id": 4,
+      "title": "504 and 5xx rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(rsdecider_requests_total{status=~\"504|5..\"}[$__rate_interval]))",
+          "legendFormat": "{{status}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+    },
+    {
+      "id": 5,
+      "title": "Queue depth by model",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rsdecider_pending{model=~\"$model\"}",
+          "legendFormat": "{{model}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "id": 6,
+      "title": "Inference seconds p50/p99 by model",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rsdecider_inference_seconds{model=~\"$model\",quantile=\"0.5\"}",
+          "legendFormat": "{{model}} p50",
+          "refId": "A"
+        },
+        {
+          "expr": "rsdecider_inference_seconds{model=~\"$model\",quantile=\"0.99\"}",
+          "legendFormat": "{{model}} p99",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "id": 7,
+      "title": "Batch size p50/p99 by model",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rsdecider_batch_size{model=~\"$model\",quantile=\"0.5\"}",
+          "legendFormat": "{{model}} p50",
+          "refId": "A"
+        },
+        {
+          "expr": "rsdecider_batch_size{model=~\"$model\",quantile=\"0.99\"}",
+          "legendFormat": "{{model}} p99",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "id": 8,
+      "title": "Cache hit ratio by tier",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (tier) (rate(rsdecider_cache_total[$__rate_interval])) / ignoring(tier) group_left sum(rate(rsdecider_cache_total[$__rate_interval]))",
+          "legendFormat": "{{tier}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "min": 0 }, "overrides": [] }
+    },
+    {
+      "id": 9,
+      "title": "Coalesced/s",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rate(rsdecider_coalesced_total[$__rate_interval])",
+          "legendFormat": "coalesced",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] }
+    },
+    {
+      "id": 10,
+      "title": "Padding waste by model",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(rsdecider_padded_tokens_total{model=~\"$model\"}[$__rate_interval])) / sum by (model) (rate(rsdecider_real_tokens_total{model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "{{model}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] }
+    },
+    {
+      "id": 11,
+      "title": "Tokens/s by source",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (source) (rate(rsdecider_tokens_total[$__rate_interval]))",
+          "legendFormat": "{{source}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] }
+    },
+    {
+      "id": 12,
+      "title": "Redis errors/s + orphaned inference/s",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rate(rsdecider_redis_errors_total[$__rate_interval])",
+          "legendFormat": "redis errors",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (model) (rate(rsdecider_orphaned_inference_total{model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "orphaned {{model}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] }
+    }
+  ]
+}

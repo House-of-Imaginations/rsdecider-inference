@@ -51,6 +51,7 @@ overloaded_retry_after_secs = 1
 redis_timeout_ms = 250
 idempotency_local_max_bytes = 67108864
 idempotency_max_stored_bytes = 262144
+# ort_global_threads = 4                # one shared ORT intra-op pool for every session; per-model intra_op_threads then ignored
 
 [[keys]]
 name = "stress"

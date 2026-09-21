@@ -52,21 +52,32 @@ pub struct OrtBackend {
 }
 
 impl OrtBackend {
-    pub fn new(model_onnx: &Path, execution_provider: &str, intra_threads: usize) -> Result<Self, String> {
+    pub fn new(
+        model_onnx: &Path,
+        execution_provider: &str,
+        intra_threads: usize,
+        global_pool: bool,
+    ) -> Result<Self, String> {
         let ep = match execution_provider {
+            // ort's CPU EP registers no arena by default; tensors are freed after every run.
             "cpu" => ort::ep::CPU::default().build(),
             #[cfg(feature = "cuda")]
             "cuda" => ort::ep::CUDA::default().with_device_id(0).build(),
             other => return Err(format!("execution provider {other:?} is not available in this build")),
         };
         let build = || -> ort::Result<Session> {
-            Session::builder()?
+            let b = Session::builder()?
                 .with_optimization_level(GraphOptimizationLevel::Level3)?
-                .with_intra_threads(intra_threads)?
-                // Two sessions plus tokio would otherwise spin-steal the fast cores between batches.
-                .with_intra_op_spinning(false)?
-                .with_execution_providers([ep])?
-                .commit_from_file(model_onnx)
+                // Shapes vary per batch: ORT would plan and cache a memory pattern for every distinct input shape.
+                .with_memory_pattern(false)?;
+            let b = if global_pool {
+                b
+            } else {
+                b.with_intra_threads(intra_threads)?
+                    // Two sessions plus tokio would otherwise spin-steal the fast cores between batches.
+                    .with_intra_op_spinning(false)?
+            };
+            b.with_execution_providers([ep])?.commit_from_file(model_onnx)
         };
         let session = build().map_err(|e| format!("{}: {e}", model_onnx.display()))?;
         Ok(Self { session })
@@ -77,16 +88,14 @@ impl Backend for OrtBackend {
     fn run(&mut self, batch: &Batch) -> Result<Vec<Raw>, String> {
         let p = pad(batch);
         let t = |shape: Vec<usize>, data: Vec<i64>| Tensor::from_array((shape, data)).map_err(|e| e.to_string());
-        let outs = self
-            .session
-            .run(ort::inputs![
-                "input_ids" => t(vec![p.b, p.l], p.input_ids)?,
-                "attention_mask" => t(vec![p.b, p.l], p.attention_mask)?,
-                "type_ids" => t(vec![p.b], p.type_ids)?,
-                "marker_pos" => t(vec![p.b, p.k], p.marker_pos)?,
-                "marker_mask" => t(vec![p.b, p.k], p.marker_mask)?,
-            ])
-            .map_err(|e| e.to_string())?;
+        let inputs = ort::inputs![
+            "input_ids" => t(vec![p.b, p.l], p.input_ids)?,
+            "attention_mask" => t(vec![p.b, p.l], p.attention_mask)?,
+            "type_ids" => t(vec![p.b], p.type_ids)?,
+            "marker_pos" => t(vec![p.b, p.k], p.marker_pos)?,
+            "marker_mask" => t(vec![p.b, p.k], p.marker_mask)?,
+        ];
+        let outs = self.session.run(inputs).map_err(|e| e.to_string())?;
         let (_, logits) = outs["logits"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
         let (_, act) = outs["act_prob"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
         Ok(batch

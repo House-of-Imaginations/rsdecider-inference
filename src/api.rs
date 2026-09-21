@@ -375,7 +375,7 @@ async fn decide_items(
             deadline,
             tokio::task::spawn_blocking(move || {
                 let _permits = (permit, queued);
-                let ids = model.tokenize(&seg)?;
+                let ids = model.tokenize_prefix(&seg, model.meta.max_len)?;
                 Ok::<_, String>(preps.iter().map(|p| encode(&model, &ids, p)).collect::<Vec<_>>())
             }),
         )

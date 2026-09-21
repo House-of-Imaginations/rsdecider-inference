@@ -39,6 +39,16 @@ fn main() -> Result<(), String> {
         }
         Cmd::Serve { config, fake_delay_ms } => {
             let cfg = Config::load(&config)?;
+            // Must run before any Session is built, so every model picks up the shared pool.
+            if let Some(n) = cfg.knobs.ort_global_threads {
+                let pool = ort::environment::GlobalThreadPoolOptions::default()
+                    .with_intra_threads(n)
+                    .and_then(|p| p.with_spin_control(false))
+                    .map_err(|e| e.to_string())?;
+                if !ort::init().with_global_thread_pool(pool).commit() {
+                    return Err("ORT environment already initialised; ort_global_threads not applied".into());
+                }
+            }
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(cfg.server.worker_threads)
                 .enable_all()
@@ -49,9 +59,9 @@ fn main() -> Result<(), String> {
     }
 }
 
-fn ort_factory(m: &ModelCfg, _lm: &LoadedModel) -> BackendFactory {
+fn ort_factory(m: &ModelCfg, _lm: &LoadedModel, global_pool: bool) -> BackendFactory {
     let (path, ep, intra) = (m.path.join("model.onnx"), m.execution_provider.clone(), m.intra_op_threads);
-    Arc::new(move || OrtBackend::new(&path, &ep, intra).map(|b| Box::new(b) as Box<dyn Backend>))
+    Arc::new(move || OrtBackend::new(&path, &ep, intra, global_pool).map(|b| Box::new(b) as Box<dyn Backend>))
 }
 
 async fn serve(cfg: Config, path: PathBuf, fake_delay_ms: Option<u64>) -> Result<(), String> {
@@ -72,7 +82,11 @@ async fn serve(cfg: Config, path: PathBuf, fake_delay_ms: Option<u64>) -> Result
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let threads = cfg.server.worker_threads
         + cfg.server.tokenize_threads
-        + cfg.models.iter().map(|m| m.workers * m.intra_op_threads).sum::<usize>();
+        + match cfg.knobs.ort_global_threads {
+            // Each concurrent Run's calling thread computes alongside the pool's n - 1 threads.
+            Some(n) => n - 1 + cfg.models.iter().map(|m| m.workers).sum::<usize>(),
+            None => cfg.models.iter().map(|m| m.workers * m.intra_op_threads).sum::<usize>(),
+        };
     if threads > cores {
         tracing::warn!("thread budget {threads} exceeds {cores} cores; expect contention");
     }
@@ -87,7 +101,10 @@ async fn serve(cfg: Config, path: PathBuf, fake_delay_ms: Option<u64>) -> Result
             let fake = Fake { delay: Duration::from_millis(ms), ..Fake::default() };
             api::build(cfg.clone(), &move |_, _| fake.factory()).await?
         }
-        None => api::build(cfg.clone(), &ort_factory).await?,
+        None => {
+            let global_pool = cfg.knobs.ort_global_threads.is_some();
+            api::build(cfg.clone(), &move |m, lm| ort_factory(m, lm, global_pool)).await?
+        }
     };
 
     #[cfg(unix)]
