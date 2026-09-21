@@ -74,6 +74,9 @@ pub struct WorkItem {
     deadline: Arc<Mutex<Instant>>,
     map: Map,
     _permit: OwnedSemaphorePermit,
+    /// `enc.ids.len()`, counted in `queued` until this item drops.
+    tokens: usize,
+    queued: Arc<AtomicUsize>,
 }
 
 impl WorkItem {
@@ -89,6 +92,7 @@ impl WorkItem {
 
 impl Drop for WorkItem {
     fn drop(&mut self) {
+        self.queued.fetch_sub(self.tokens, Ordering::Relaxed);
         let mut map = self.map.lock().unwrap();
         if map.get(&self.key).is_some_and(|e| e.generation == self.generation) {
             map.remove(&self.key);
@@ -103,8 +107,10 @@ struct ModelQueue {
     tx: mpsc::UnboundedSender<WorkItem>,
     workers: usize,
     live: Arc<AtomicUsize>,
-    /// EMA of inference seconds per item, as f64 bits; 0.0 = no estimate yet.
-    secs_per_item: Arc<AtomicU64>,
+    /// EMA of inference seconds per real token (absorbs average padding), as f64 bits; 0.0 = no estimate yet.
+    secs_per_token: Arc<AtomicU64>,
+    /// Tokens of admitted items not yet finished or dropped (queued or in a running batch).
+    queued_tokens: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -129,7 +135,7 @@ impl Scheduler {
             let (ready_tx, ready_rx) = std_mpsc::channel();
             let idle = Arc::new(Semaphore::new(spec.workers));
             let live = Arc::new(AtomicUsize::new(spec.workers));
-            let secs_per_item = Arc::new(AtomicU64::new(0));
+            let secs_per_token = Arc::new(AtomicU64::new(0));
             for w in 0..spec.workers {
                 let ctx = WorkerCtx {
                     name: spec.name.clone(),
@@ -142,7 +148,7 @@ impl Scheduler {
                     max_pending: spec.max_pending,
                     idle: idle.clone(),
                     live: live.clone(),
-                    secs_per_item: secs_per_item.clone(),
+                    secs_per_token: secs_per_token.clone(),
                 };
                 let ready = ready_tx.clone();
                 std::thread::Builder::new()
@@ -162,7 +168,8 @@ impl Scheduler {
                 tx,
                 workers: spec.workers,
                 live,
-                secs_per_item,
+                secs_per_token,
+                queued_tokens: Arc::default(),
             });
         }
         Ok(Self { map, models: Arc::new(models), next_gen: Arc::default() })
@@ -236,13 +243,14 @@ impl Scheduler {
                     continue;
                 }
                 let q = &self.models[m];
-                // Shed now if the work already queued ahead cannot drain before the deadline (fast 529,
-                // not a late 504). Only work ahead counts: an idle queue always admits, so a stale high
+                // Shed now if the work already queued ahead plus this request cannot finish before the
+                // deadline (fast 529, not a late 504). An idle queue always admits, so a stale high
                 // estimate can't shed large requests forever.
-                let spi = f64::from_bits(q.secs_per_item.load(Ordering::Relaxed));
-                let ahead = q.max_pending - q.permits.available_permits();
+                let spt = f64::from_bits(q.secs_per_token.load(Ordering::Relaxed));
+                let ahead = q.queued_tokens.load(Ordering::Relaxed);
+                let own: usize = fresh.iter().filter(|j| j.model == m).map(|j| j.enc.ids.len()).sum();
                 let left = deadline.saturating_duration_since(Instant::now()).as_secs_f64();
-                if spi > 0.0 && ahead > 0 && ahead as f64 * spi / q.workers as f64 > left {
+                if spt > 0.0 && ahead > 0 && (ahead + own) as f64 * spt / q.workers as f64 > left {
                     metrics::counter!("rsdecider_shed_total", "model" => q.name.clone()).increment(1);
                     return Err(SchedError::Overloaded);
                 }
@@ -270,6 +278,9 @@ impl Scheduler {
         }
         // Lock released: build WorkItems and enqueue, with no await in between.
         for (job, generation, tx, deadline, permit) in parts {
+            let q = &self.models[job.model];
+            let tokens = job.enc.ids.len();
+            q.queued_tokens.fetch_add(tokens, Ordering::Relaxed);
             let item = WorkItem {
                 key: job.key,
                 generation,
@@ -278,10 +289,12 @@ impl Scheduler {
                 deadline,
                 map: self.map.clone(),
                 _permit: permit,
+                tokens,
+                queued: q.queued_tokens.clone(),
             };
             // A send error means the batcher is gone (shutdown, or every worker retired): fail
             // subscribers now instead of letting them re-admit until the deadline.
-            if let Err(mpsc::error::SendError(mut item)) = self.models[job.model].tx.send(item) {
+            if let Err(mpsc::error::SendError(mut item)) = q.tx.send(item) {
                 item.finish(Err("model workers unavailable".into()));
             }
         }
@@ -362,7 +375,7 @@ struct WorkerCtx {
     max_pending: usize,
     idle: Arc<Semaphore>,
     live: Arc<AtomicUsize>,
-    secs_per_item: Arc<AtomicU64>,
+    secs_per_token: Arc<AtomicU64>,
 }
 
 fn worker(ctx: WorkerCtx, ready: std_mpsc::Sender<Result<(), String>>) {
@@ -388,8 +401,8 @@ fn worker(ctx: WorkerCtx, ready: std_mpsc::Sender<Result<(), String>>) {
         let mut panicked = false;
         let failure = match result {
             Ok(Ok(raws)) if raws.len() == items.len() => {
-                let x = batch_secs / items.len() as f64;
-                let _ = ctx.secs_per_item.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+                let x = batch_secs / items.iter().map(|i| i.enc.ids.len()).sum::<usize>().max(1) as f64;
+                let _ = ctx.secs_per_token.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
                     let old = f64::from_bits(b);
                     Some(if old == 0.0 { x } else { 0.8 * old + 0.2 * x }.to_bits())
                 });
@@ -591,6 +604,8 @@ mod tests {
             deadline: Arc::new(Mutex::new(Instant::now())),
             map: Arc::default(),
             _permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            tokens: 0,
+            queued: Arc::default(),
         }
     }
 
@@ -679,6 +694,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn own_work_counts_toward_the_deadline() {
+        let fake = Fake { delay: Duration::from_millis(100), ..Fake::default() };
+        let s = sched(vec![spec("m", &fake, 64, 1, 8192)]).await;
+        s.run_jobs(vec![job(1, 0, 4)], secs(5)).await.unwrap(); // seeds the estimate: ~0.1 s per 4 tokens
+        let busy = {
+            let s = s.clone();
+            tokio::spawn(async move { s.run_jobs(vec![job(2, 0, 4)], secs(5)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await; // 1 item ahead: ~0.1 s
+        let started = Instant::now();
+        // Ahead alone fits 300 ms; ahead plus these 5 items (~0.6 s) does not.
+        let r = s.run_jobs((3..8).map(|n| job(n, 0, 4)).collect(), Instant::now() + Duration::from_millis(300)).await;
+        assert_eq!(r.unwrap_err(), SchedError::Overloaded);
+        assert!(started.elapsed() < Duration::from_millis(50), "shed at admission, not at the deadline");
+        busy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_tokens_return_to_zero() {
+        let fake = Fake { delay: Duration::from_millis(100), ..Fake::default() };
+        let s = sched(vec![spec("m", &fake, 64, 1, 8192)]).await;
+        s.run_jobs(vec![job(1, 0, 400)], secs(5)).await.unwrap(); // success; low estimate: 0.25 ms/token
+        let busy = {
+            let s = s.clone();
+            tokio::spawn(async move { s.run_jobs(vec![job(2, 0, 4)], secs(5)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let r = s.run_jobs(vec![job(3, 0, 4)], Instant::now() + Duration::from_millis(50)).await;
+        assert_eq!(r.unwrap_err(), SchedError::Deadline, "admitted, then stuck behind the busy batch");
+        let r = s.run_jobs((4..9).map(|n| job(n, 0, 400)).collect(), Instant::now() + Duration::from_millis(300)).await;
+        assert_eq!(r.unwrap_err(), SchedError::Overloaded);
+        busy.await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await; // the dead item is dropped once the worker frees
+        assert_eq!(s.models[0].queued_tokens.load(Ordering::Relaxed), 0);
+        assert!(s.map.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn large_request_on_idle_queue_is_admitted_despite_high_estimate() {
         let fake = Fake { delay: Duration::from_millis(200), ..Fake::default() };
         let s = sched(vec![spec("m", &fake, 64, 8, 8192)]).await;
@@ -714,6 +767,8 @@ mod tests {
             deadline: dl,
             map: map.clone(),
             _permit: permit,
+            tokens: 0,
+            queued: Arc::default(),
         };
         drop(old);
         assert!(map.lock().unwrap().contains_key(&[1; 32]));
