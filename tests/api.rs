@@ -239,3 +239,14 @@ async fn health_endpoints_need_no_auth() {
         assert_eq!(r.status(), StatusCode::OK);
     }
 }
+
+#[tokio::test]
+async fn full_tokenize_queue_sheds_529_before_holding_the_request() {
+    let (app, st) = app(config(|_| {}), &Fake::default()).await;
+    let held = st.tokenize_queue.clone().try_acquire_many_owned(st.tokenize_queue.available_permits() as u32).unwrap();
+    let (s, h, b) = call(&app, "/v1/decide", decide_body("queue is full", "q"), &[auth()]).await;
+    assert_eq!((s.as_u16(), b["error"]["code"].as_str()), (529, Some("overloaded")));
+    assert!(h.contains_key("retry-after"));
+    drop(held);
+    assert_eq!(call(&app, "/v1/decide", decide_body("queue is full", "q"), &[auth()]).await.0, StatusCode::OK);
+}

@@ -159,7 +159,7 @@ Errors are `{"error": {"code", "message"}}`. Checks run in this order:
 | `422` | `invalid_request` | Bad JSON/field (message names the path, e.g. `items[1].`), unknown model, non-ASCII `Idempotency-Key`, key reused with a different body |
 | `429` | `rate_limited` | Per-key bucket empty — honour `Retry-After` |
 | `409` | `idempotency_in_progress` | Same `Idempotency-Key` still running — honour `Retry-After` |
-| `529` | `overloaded` | Queue can't finish this work before the deadline — honour `Retry-After` |
+| `529` | `overloaded` | Tokenize queue full, or the model queue can't finish this work before the deadline — honour `Retry-After` |
 | `504` | `deadline_exceeded` | Passed `server.request_timeout_ms` |
 | `500` | `internal` | Inference failed (e.g. worker panic); the next request is served normally |
 </details>
@@ -244,7 +244,7 @@ and names the offending field. Edit `[[keys]]` and send `SIGHUP` to add, rotate 
 - **CPU budget:** `Σ(workers × intra_op_threads) + tokenize_threads + worker_threads ≈ vCPUs`. Giving the busier model more
   `intra_op_threads` usually beats adding `workers`. The stress config for a 10-core M1 Pro uses english `6`,
   multilingual `2`, tokenize `1`, HTTP `2` ([`stress/rsdecider.stress.toml`](./stress/rsdecider.stress.toml)).
-- **`max_pending ≈ items/s × 1–2 s`.** It bounds memory; latency is protected separately because admission estimates
+- **`max_pending ≈ items/s × 1–2 s`.** It bounds memory (the sum across models also caps requests waiting to tokenize); latency is protected separately because admission estimates
   queue time (EMA seconds/item × depth ÷ workers) and returns `529` up front when work can't finish by the deadline.
 - **GPU:** build with `cargo build --release --features cuda` and set `execution_provider = "cuda"`.
 - **More than one instance:** set `redis_url` so the cache and idempotency are shared.

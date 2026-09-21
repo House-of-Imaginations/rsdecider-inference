@@ -100,6 +100,8 @@ pub struct AppState {
     pub auth: Arc<Auth>,
     pub idem: Idem,
     pub tokenize: Arc<Semaphore>,
+    /// Requests tokenizing or waiting to; when empty, new work is shed with 529.
+    pub tokenize_queue: Arc<Semaphore>,
 }
 
 /// Loads every model, connects the cache, starts the scheduler. `make_backend` picks ORT or Fake.
@@ -142,6 +144,8 @@ pub async fn build(
         non_english: by_name[&cfg.routing.non_english_model],
         auth: Arc::new(Auth::new(&cfg.keys)),
         tokenize: Arc::new(Semaphore::new(cfg.server.tokenize_threads.max(1))),
+        // same memory knob as the scheduler queues: requests past Σ max_pending can't be admitted anyway
+        tokenize_queue: Arc::new(Semaphore::new(cfg.models.iter().map(|m| m.max_pending).sum())),
         models,
         by_name,
         cache,
@@ -246,7 +250,8 @@ async fn run(
             let route: &[u8] = if batch { b"batch\n" } else { b"decide\n" };
             let body_sha =
                 hex::encode(<[u8; 32]>::from(Sha256::new().chain_update(route).chain_update(&body).finalize()));
-            match st.idem.begin(&key.cfg.name, ik, &body_sha, id).await {
+            let begin = tokio::time::timeout_at(deadline, st.idem.begin(&key.cfg.name, ik, &body_sha, id));
+            match begin.await.map_err(|_| ApiError::Deadline)? {
                 Begin::Proceed(g) => Some(g),
                 Begin::Replay(v) => return Ok(v),
                 Begin::InProgress(d) => return Err(ApiError::InProgress(d)),
@@ -354,6 +359,8 @@ async fn decide_items(
         }
         let model = st.models[routes[i].0].clone();
         let (seg, preps) = (seg.clone(), missing.iter().map(|q| q.prep.clone()).collect::<Vec<_>>());
+        // bounded wait: shed instead of holding the parsed request until its deadline
+        let queued = st.tokenize_queue.clone().try_acquire_owned().map_err(|_| ApiError::Overloaded)?;
         let permit = tokio::time::timeout_at(deadline, st.tokenize.clone().acquire_owned())
             .await
             .map_err(|_| ApiError::Deadline)?
@@ -363,7 +370,7 @@ async fn decide_items(
         let encoded = tokio::time::timeout_at(
             deadline,
             tokio::task::spawn_blocking(move || {
-                let _permit = permit;
+                let _permits = (permit, queued);
                 let ids = model.tokenize(&seg)?;
                 Ok::<_, String>(preps.iter().map(|p| encode(&model, &ids, p)).collect::<Vec<_>>())
             }),
