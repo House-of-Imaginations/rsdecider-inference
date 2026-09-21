@@ -1,0 +1,15 @@
+{
+ "max_len": 64,
+ "head_max_len": 32,
+ "mask_token": "[MASK]",
+ "mask_id": 4,
+ "cls_id": 1,
+ "sep_id": 2,
+ "pad_id": 3,
+ "temperature": [
+  1.0,
+  1.0,
+  1.0
+ ],
+ "temperature_by_options": {}
+}

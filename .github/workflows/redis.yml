@@ -1,0 +1,25 @@
+name: redis
+
+# heavy check: pull requests and main only
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'tests/**', 'openapi.yaml', 'Cargo.toml', 'Cargo.lock', '.github/workflows/redis.yml']
+  pull_request:
+    paths: ['src/**', 'tests/**', 'openapi.yaml', 'Cargo.toml', 'Cargo.lock', '.github/workflows/redis.yml']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  redis:
+    runs-on: ubuntu-latest # has Docker, which testcontainers uses to start redis:7
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --features redis-tests --test redis

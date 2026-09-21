@@ -1,0 +1,16 @@
+# Run from this folder: docker compose up --build
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+  rsdecider:
+    build:
+      context: ..
+      dockerfile: self-hosted/Dockerfile
+    depends_on: [redis]
+    ports: ["3000:3000", "127.0.0.1:9000:9000"]
+    restart: unless-stopped
+    stop_grace_period: 15s
+    volumes:
+      - ../models:/models:ro
+      - ./rsdecider.toml:/etc/rsdecider/rsdecider.toml:ro

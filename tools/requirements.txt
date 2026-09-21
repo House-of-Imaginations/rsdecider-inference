@@ -1,0 +1,8 @@
+laya==0.3.4
+torch>=2.4
+transformers>=4.48
+onnx>=1.16
+onnxruntime>=1.20
+huggingface_hub
+safetensors
+numpy

@@ -1,0 +1,8 @@
+/target
+docs/superpowers/
+.omc/
+.claude/skills/
+skills-lock.json
+.superpowers/
+.venv/
+models/

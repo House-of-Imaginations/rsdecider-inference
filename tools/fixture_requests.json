@@ -1,0 +1,233 @@
+[
+ {
+  "state": "The customer was charged twice for invoice 4411 and wants a refund.",
+  "questions": {
+   "action": {
+    "type": "choice",
+    "instructions": "Decide how to handle this refund request.",
+    "criteria": {
+     "approve": "refund is justified",
+     "deny": "refund is not justified",
+     "escalate": "a human must review"
+    }
+   },
+   "urgent": {
+    "type": "noul",
+    "instructions": "Is this urgent?"
+   },
+   "severity": {
+    "type": "score",
+    "instructions": "How severe is the issue?",
+    "criteria": [
+     "trivial",
+     "minor",
+     "major",
+     "critical"
+    ]
+   }
+  }
+ },
+ {
+  "state": {
+   "subject": "Refund",
+   "body": "Charged twice",
+   "amount": 1e+16,
+   "ratio": 1e-05,
+   "items": [
+    1,
+    2.5,
+    null,
+    true
+   ]
+  },
+  "questions": {
+   "action": {
+    "type": "choice",
+    "instructions": "Decide how to handle this refund request.",
+    "criteria": {
+     "approve": "refund is justified",
+     "deny": "refund is not justified",
+     "escalate": "a human must review"
+    }
+   }
+  }
+ },
+ {
+  "state": {
+   "body": "Charged twice",
+   "subject": "Refund"
+  },
+  "questions": {
+   "action": {
+    "type": "choice",
+    "instructions": "Decide how to handle this refund request.",
+    "criteria": {
+     "approve": "refund is justified",
+     "deny": "refund is not justified",
+     "escalate": "a human must review"
+    }
+   }
+  }
+ },
+ {
+  "state": {
+   "subject": "Refund",
+   "body": "Charged twice"
+  },
+  "questions": {
+   "action": {
+    "type": "choice",
+    "instructions": "Decide how to handle this refund request.",
+    "criteria": {
+     "approve": "refund is justified",
+     "deny": "refund is not justified",
+     "escalate": "a human must review"
+    }
+   }
+  }
+ },
+ {
+  "state": "Le client a été facturé deux fois et il demande un remboursement pour la facture qui a été payée le mois dernier",
+  "questions": {
+   "action": {
+    "type": "choice",
+    "instructions": "Decide how to handle this refund request.",
+    "criteria": {
+     "approve": "refund is justified",
+     "deny": "refund is not justified",
+     "escalate": "a human must review"
+    }
+   }
+  }
+ },
+ {
+  "state": "Der Kunde wurde zweimal belastet und möchte eine Rückerstattung für die Rechnung",
+  "questions": {
+   "action": {
+    "type": "choice",
+    "instructions": "Decide how to handle this refund request.",
+    "criteria": {
+     "approve": "refund is justified",
+     "deny": "refund is not justified",
+     "escalate": "a human must review"
+    }
+   }
+  }
+ },
+ {
+  "state": "ग्राहक से दो बार शुल्क लिया गया और वह धनवापसी चाहता है।",
+  "questions": {
+   "action": {
+    "type": "choice",
+    "instructions": "Decide how to handle this refund request.",
+    "criteria": {
+     "approve": "refund is justified",
+     "deny": "refund is not justified",
+     "escalate": "a human must review"
+    }
+   }
+  }
+ },
+ {
+  "state": "お客様は二重に請求されたため返金を希望しています。",
+  "questions": {
+   "urgent": {
+    "type": "noul",
+    "instructions": "Is this urgent?"
+   }
+  }
+ },
+ {
+  "state": "С клиента дважды сняли деньги и он хочет возврат",
+  "questions": {
+   "urgent": {
+    "type": "noul",
+    "instructions": "Is this urgent?",
+    "criteria": {
+     "false": "can wait",
+     "true": "needs action today"
+    }
+   }
+  }
+ },
+ {
+  "state": [
+   {
+    "role": "user",
+    "content": "my card was charged twice"
+   },
+   {
+    "role": "agent",
+    "content": "sorry to hear that"
+   }
+  ],
+  "questions": {
+   "topic": {
+    "type": "choice",
+    "instructions": "Topic",
+    "criteria": [
+     "billing",
+     "shipping",
+     "account"
+    ]
+   }
+  }
+ },
+ {
+  "state": "Rule check",
+  "questions": {
+   "policy": {
+    "type": "noul",
+    "instructions": {
+     "rule": "refund if charged twice",
+     "café": true
+    }
+   }
+  }
+ },
+ {
+  "state": "Rate with a rubric",
+  "questions": {
+   "quality": {
+    "type": "score",
+    "instructions": "Rate",
+    "criteria": [
+     {
+      "desc": "bad",
+      "max": 0
+     },
+     {
+      "desc": "ok"
+     },
+     "great"
+    ]
+   }
+  }
+ },
+ {
+  "state": "Structured choice",
+  "questions": {
+   "route": {
+    "type": "choice",
+    "instructions": "Route",
+    "criteria": {
+     "billing": {
+      "team": "B",
+      "sla_h": 4
+     },
+     "tech": "",
+     "other": null
+    }
+   }
+  }
+ },
+ {
+  "state": "Contains [MASK] token in text",
+  "questions": {
+   "m": {
+    "type": "noul",
+    "instructions": "Does [MASK] appear?"
+   }
+  }
+ }
+]

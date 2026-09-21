@@ -1,0 +1,27 @@
+name: clippy
+
+# light check: every push on any branch, and pull requests
+on:
+  push:
+    branches: ['**']
+    paths: ['src/**', 'tests/**', 'openapi.yaml', 'Cargo.toml', 'Cargo.lock', '.github/workflows/clippy.yml']
+  pull_request:
+    paths: ['src/**', 'tests/**', 'openapi.yaml', 'Cargo.toml', 'Cargo.lock', '.github/workflows/clippy.yml']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy }
+      - uses: Swatinem/rust-cache@v2
+      # every feature-gated suite (parity, redis-tests, e2e) is linted even where it isn't run
+      - run: cargo clippy --locked --all-targets --features parity,redis-tests,e2e -- -D warnings

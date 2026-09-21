@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="440" viewBox="0 0 1200 440" role="img" aria-labelledby="title desc">
+  <title id="title">rsdecider</title>
+  <desc id="desc">rsdecider serves Laya decision models over HTTP. A request's text is routed to the English or multilingual model, packed into a micro-batch of eight, and answered with Laya-shaped probabilities; when the queue is full it is shed with 529 and Retry-After.</desc>
+
+  <rect width="1200" height="440" rx="24" fill="#0B0D10"/>
+
+  <g id="title-block" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+    <text x="64" y="96" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" letter-spacing="3" fill="#8A8F98">LAYA INFERENCE SERVER</text>
+    <text x="60" y="184" font-size="92" font-weight="700" letter-spacing="-2" fill="#F2EFE8">rsdecider</text>
+    <!-- motif: one full micro-batch -->
+    <g fill="#F2EFE8">
+      <rect x="64" y="210" width="16" height="16" rx="3"/><rect x="86" y="210" width="16" height="16" rx="3"/>
+      <rect x="108" y="210" width="16" height="16" rx="3"/><rect x="130" y="210" width="16" height="16" rx="3"/>
+      <rect x="152" y="210" width="16" height="16" rx="3"/><rect x="174" y="210" width="16" height="16" rx="3"/>
+      <rect x="196" y="210" width="16" height="16" rx="3"/><rect x="218" y="210" width="16" height="16" rx="3"/>
+    </g>
+    <rect x="240" y="210" width="16" height="16" rx="3" fill="none" stroke="#F5A524" stroke-width="2"/>
+    <text x="64" y="284" font-size="28" fill="#D9D5CC">Laya decisions over HTTP.</text>
+    <text x="64" y="320" font-size="28" fill="#D9D5CC">Batched, cached, rate-limited —</text>
+    <text x="64" y="356" font-size="28" fill="#D9D5CC">and shed before the box tips over.</text>
+    <text x="64" y="398" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#8A8F98">tokio · axum · onnx runtime · moka · redis</text>
+  </g>
+
+  <g id="project-proof" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="19">
+    <rect x="640" y="44" width="512" height="352" rx="16" fill="#13161B" stroke="#262B33"/>
+
+    <text x="668" y="84" fill="#8A8F98">POST /v1/decide</text>
+    <text x="668" y="116" fill="#F2EFE8">"Charged twice for invoice…"</text>
+
+    <!-- Laya routing -->
+    <rect x="668" y="150" width="138" height="36" rx="18" fill="#F2EFE8"/>
+    <text x="737" y="174" text-anchor="middle" fill="#0B0D10" font-weight="600">english</text>
+    <rect x="820" y="150" width="182" height="36" rx="18" fill="none" stroke="#4A505A"/>
+    <text x="911" y="174" text-anchor="middle" fill="#8A8F98">multilingual</text>
+    <text x="1016" y="174" font-size="18" fill="#8A8F98">routed</text>
+
+    <!-- micro-batch -->
+    <g fill="#F2EFE8">
+      <rect x="668" y="210" width="34" height="34" rx="6"/><rect x="710" y="210" width="34" height="34" rx="6"/>
+      <rect x="752" y="210" width="34" height="34" rx="6"/><rect x="794" y="210" width="34" height="34" rx="6"/>
+      <rect x="836" y="210" width="34" height="34" rx="6"/><rect x="878" y="210" width="34" height="34" rx="6"/>
+      <rect x="920" y="210" width="34" height="34" rx="6"/><rect x="962" y="210" width="34" height="34" rx="6"/>
+    </g>
+    <text x="1016" y="234" font-size="18" fill="#8A8F98">batch 8/8</text>
+    <text x="668" y="278" font-size="18" fill="#F5A524">queue full → 529 · Retry-After</text>
+
+    <!-- real answer from laya-english -->
+    <path d="M668 298 H1124" stroke="#262B33"/>
+    <text x="668" y="332" fill="#8A8F98">action   <tspan fill="#F2EFE8">escalate</tspan>  0.44</text>
+    <text x="668" y="366" fill="#8A8F98">urgent   <tspan fill="#F2EFE8">0.73</tspan>      severity <tspan fill="#F2EFE8">1.17</tspan></text>
+  </g>
+</svg>

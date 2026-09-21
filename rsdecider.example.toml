@@ -1,0 +1,56 @@
+# Copy to rsdecider.toml. Size workers × intra_op_threads + tokenize_threads + worker_threads ≈ vCPUs.
+[server]
+listen = "0.0.0.0:3000"
+metrics_listen = "127.0.0.1:9000"
+worker_threads = 2        # tokio (HTTP) threads
+tokenize_threads = 2      # concurrent spawn_blocking tokenizations
+request_timeout_ms = 10000
+
+[limits]
+max_body_bytes = 1048576
+max_state_chars = 100000
+max_batch_states = 8
+max_questions_per_state = 16
+
+[routing]                 # Laya routing mode: English → english_model, else non_english_model
+english_model = "english"
+non_english_model = "multilingual"
+
+[[models]]
+name = "english"
+path = "models/english"   # model.onnx + tokenizer.json + laya.json (tools/export_onnx.py)
+execution_provider = "cpu" # or "cuda" (build with --features cuda)
+workers = 1               # ORT sessions, one per blocking thread
+intra_op_threads = 6
+# Size max_pending ≈ items/s × 1-2 s. It is a memory bound; latency is handled by admission, which
+# returns 529 up front when the queued work (EMA s/item × depth / workers) cannot finish by the deadline.
+max_pending = 256         # queue bound in questions; beyond this → 529
+max_batch_items = 8
+max_batch_tokens = 8192
+max_wait_ms = 2
+
+[[models]]
+name = "multilingual"
+path = "models/multilingual"
+
+[cache]
+l1_max_bytes = 268435456
+l1_ttl_secs = 3600
+# redis_url = "redis://127.0.0.1:6379"
+l2_ttl_secs = 86400
+idempotency_ttl_secs = 86400
+
+# Advanced limits; every field is optional (see src/knobs.rs).
+[knobs]
+# tokenize_queue             = 512      # requests tokenizing or waiting → 529 when full (default Σ max_pending)
+overloaded_retry_after_secs  = 1        # Retry-After on 529
+redis_timeout_ms             = 250      # per Redis command; then cache miss / local idempotency
+idempotency_local_max_bytes  = 67108864 # in-process idempotency store (64 MiB)
+idempotency_max_stored_bytes = 262144   # larger responses re-run on repeat (256 KiB)
+
+# Generate: rsdecider hash-key <secret>
+[[keys]]
+name = "dev"
+sha256 = "7e9f8fd111802be56c379d597842e29b2cebd35ff2133d431a49fa556a18704e" # "dev-key"
+rps = 50
+burst = 100
