@@ -30,10 +30,20 @@ pub struct Guard {
 
 pub struct Idem {
     redis: Option<ConnectionManager>,
-    local: moka::sync::Cache<String, (Record, Instant)>,
+    local: moka::sync::Cache<String, Entry>,
     pending_ttl: Duration,
     done_ttl: Duration,
 }
+
+/// Record, its deadline, and its weight in bytes (the serialized size).
+type Entry = (Record, Instant, u32);
+
+/// Bytes the in-process map may hold across all keys.
+const LOCAL_MAX_BYTES: u64 = 64 << 20;
+/// Larger responses are not stored: a repeat runs again instead of pinning memory.
+pub const MAX_STORED_BYTES: usize = 256 << 10;
+/// Weight of a pending record (hashes + owner id).
+const PENDING_BYTES: u32 = 160;
 
 const DEL_IF_OWNER: &str = r"local v = redis.call('GET', KEYS[1])
 if v and cjson.decode(v).owner == ARGV[1] then return redis.call('DEL', KEYS[1]) end
@@ -41,8 +51,11 @@ return 0";
 
 impl Idem {
     pub fn new(redis: Option<ConnectionManager>, request_timeout: Duration, done_ttl: Duration) -> Self {
-        // ponytail: bounded by entry count, not bytes; ~100k × response size. Weigh by bytes if Done bodies grow.
-        let local = moka::sync::Cache::builder().max_capacity(100_000).expire_after(ExpiresAt).build();
+        let local = moka::sync::Cache::builder()
+            .max_capacity(LOCAL_MAX_BYTES)
+            .weigher(|k: &String, v: &Entry| (k.len() as u32).saturating_add(v.2))
+            .expire_after(ExpiresAt)
+            .build();
         Self { redis, local, pending_ttl: request_timeout + Duration::from_secs(5), done_ttl }
     }
 
@@ -58,11 +71,11 @@ impl Idem {
             }
         }
         let now = Instant::now();
-        let e = self.local.entry(rec_key.clone()).or_insert_with(|| (pending, now + self.pending_ttl));
+        let e = self.local.entry(rec_key.clone()).or_insert_with(|| (pending, now + self.pending_ttl, PENDING_BYTES));
         if e.is_fresh() {
             return Begin::Proceed(guard(true));
         }
-        let (rec, exp) = e.into_value();
+        let (rec, exp, _) = e.into_value();
         existing(&rec, body_sha, exp.saturating_duration_since(now))
     }
 
@@ -96,18 +109,22 @@ impl Idem {
     }
 
     /// `response` = Some(body) on 200 (stored for replay), None on any error (record released).
+    /// A response over `MAX_STORED_BYTES` is treated like an error: released, not stored.
     pub async fn finish(&self, g: Guard, response: Option<&Value>) {
+        let done = response
+            .map(|r| Record::Done { body_sha: g.body_sha.clone(), response: r.clone() })
+            .map(|rec| {
+                let json = serde_json::to_string(&rec).unwrap();
+                (rec, json)
+            })
+            .filter(|(_, json)| json.len() <= MAX_STORED_BYTES);
         if !g.local
             && let Some(mut con) = self.redis.clone()
         {
-            let res = match response {
-                Some(r) => {
-                    let rec = Record::Done { body_sha: g.body_sha.clone(), response: r.clone() };
+            let res = match done {
+                Some((_, json)) => {
                     let mut set = redis::cmd("SET");
-                    set.arg(&g.rec_key)
-                        .arg(serde_json::to_string(&rec).unwrap())
-                        .arg("PX")
-                        .arg(self.done_ttl.as_millis() as u64);
+                    set.arg(&g.rec_key).arg(json).arg("PX").arg(self.done_ttl.as_millis() as u64);
                     timed(set.query_async::<()>(&mut con)).await
                 }
                 None => {
@@ -122,14 +139,13 @@ impl Idem {
             }
             return;
         }
-        match response {
-            Some(r) => {
-                let rec = Record::Done { body_sha: g.body_sha, response: r.clone() };
-                self.local.insert(g.rec_key, (rec, Instant::now() + self.done_ttl));
+        match done {
+            Some((rec, json)) => {
+                self.local.insert(g.rec_key, (rec, Instant::now() + self.done_ttl, json.len() as u32));
             }
             None => {
                 self.local.entry(g.rec_key).and_compute_with(|cur| match cur.map(|e| e.into_value()) {
-                    Some((Record::Pending { owner, .. }, _)) if owner == g.owner => Op::Remove,
+                    Some((Record::Pending { owner, .. }, _, _)) if owner == g.owner => Op::Remove,
                     _ => Op::Nop,
                 });
             }
@@ -140,18 +156,12 @@ impl Idem {
 /// Per-entry expiry: each record carries its own deadline (pending vs done TTL).
 struct ExpiresAt;
 
-impl moka::Expiry<String, (Record, Instant)> for ExpiresAt {
-    fn expire_after_create(&self, _: &String, v: &(Record, Instant), now: Instant) -> Option<Duration> {
+impl moka::Expiry<String, Entry> for ExpiresAt {
+    fn expire_after_create(&self, _: &String, v: &Entry, now: Instant) -> Option<Duration> {
         Some(v.1.saturating_duration_since(now))
     }
 
-    fn expire_after_update(
-        &self,
-        _: &String,
-        v: &(Record, Instant),
-        now: Instant,
-        _: Option<Duration>,
-    ) -> Option<Duration> {
+    fn expire_after_update(&self, _: &String, v: &Entry, now: Instant, _: Option<Duration>) -> Option<Duration> {
         Some(v.1.saturating_duration_since(now))
     }
 }
@@ -204,6 +214,26 @@ mod tests {
         let Begin::Proceed(g) = i.begin("acme", "k1", "sha-a", "req1").await else { panic!() };
         i.finish(g, None).await;
         assert!(matches!(i.begin("acme", "k1", "sha-a", "req2").await, Begin::Proceed(_)));
+    }
+
+    #[tokio::test]
+    async fn oversized_responses_are_released_not_stored() {
+        let i = idem();
+        let Begin::Proceed(g) = i.begin("acme", "k1", "sha-a", "req1").await else { panic!() };
+        i.finish(g, Some(&json!("x".repeat(MAX_STORED_BYTES)))).await;
+        assert!(matches!(i.begin("acme", "k1", "sha-a", "req2").await, Begin::Proceed(_)));
+    }
+
+    #[tokio::test]
+    async fn local_map_is_bounded_by_bytes() {
+        let i = idem();
+        let big = json!("x".repeat(MAX_STORED_BYTES - 100));
+        for n in 0..(2 * LOCAL_MAX_BYTES as usize / MAX_STORED_BYTES) {
+            let Begin::Proceed(g) = i.begin("acme", &format!("k{n}"), "sha", "req").await else { panic!() };
+            i.finish(g, Some(&big)).await;
+        }
+        i.local.run_pending_tasks();
+        assert!(i.local.weighted_size() <= LOCAL_MAX_BYTES, "{} bytes held", i.local.weighted_size());
     }
 
     #[tokio::test]

@@ -151,7 +151,7 @@ components:
       name: Idempotency-Key
       in: header
       required: false
-      description: Visible ASCII. A repeat with the same body replays the stored 200 response (same id); while the first is running → 409; a different body → 422. Errors are never stored.
+      description: Visible ASCII. A repeat with the same body replays the stored 200 response (same id); while the first is running → 409; a different body → 422. Errors and responses over 256 KiB are never stored (a repeat runs again).
       schema: { type: string }
 
   headers:
