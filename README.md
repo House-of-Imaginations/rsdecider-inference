@@ -78,12 +78,12 @@ The same request again returns in `0.1 ms` with `"cached": true`. A Vietnamese `
 | | |
 |---|---|
 | **Laya routing mode** | Script/language detection sends English to `english`, everything else to `multilingual`; `"model"` overrides it. |
-| **Controlled concurrency** | Per-model queue bound (`max_pending`), all-or-nothing admission, deadline-aware shedding (`529` + `Retry-After`) and a fixed ORT thread budget sized to your CPUs. |
+| **Controlled concurrency** | Bounded tokenize queue and per-model queues (`max_pending`), all-or-nothing admission, deadline-aware shedding (`529` + `Retry-After`) and a fixed ORT thread budget sized to your CPUs. |
 | **Micro-batching** | Questions from concurrent requests are packed into padded batches (`max_batch_items`, `max_batch_tokens`, `max_wait_ms`). |
 | **Coalescing** | 100 identical in-flight questions run the model once. |
 | **Two-tier cache** | L1 in-process (moka, byte-bounded) and optional L2 Redis shared across instances. |
 | **API keys + rate limits** | Only SHA-256 hashes live in config; per-key token bucket (`rps`, `burst`), a batch costs one token per item. `kill -HUP` reloads `[[keys]]` without a restart. |
-| **Idempotency** | `Idempotency-Key` replays the stored response; Redis `SET NX` across instances, bounded in-process fallback. |
+| **Idempotency** | `Idempotency-Key` replays the stored response; Redis `SET NX` across instances, byte-bounded in-process fallback. |
 | **Operability** | Prometheus metrics, `/healthz` + `/readyz`, request ids in logs and `x-request-id`, worker panics isolated. |
 
 ## Quick start
@@ -239,15 +239,44 @@ The server refuses to start on an invalid file (unknown routing target, duplicat
 and names the offending field. Edit `[[keys]]` and send `SIGHUP` to add, rotate or revoke keys live (other sections need a restart).
 </details>
 
-### Sizing for your machine
+### Tuning
 
-- **CPU budget:** `Σ(workers × intra_op_threads) + tokenize_threads + worker_threads ≈ vCPUs`. Giving the busier model more
-  `intra_op_threads` usually beats adding `workers`. The stress config for a 10-core M1 Pro uses english `6`,
+Every request passes three bounded stages: **tokenize → model queue → ORT workers**. Size the thread budget to your CPUs
+first, then set the queues from the throughput you measure (the `rsdecider_*` metrics on `:9000`, or `stress/run.sh`).
+
+| Knob | Controls | Raise it when | Lower it when |
+|---|---|---|---|
+| `models.intra_op_threads` | Threads per forward pass (latency of one batch) | a model is busy and cores are idle | the CPU is oversubscribed |
+| `models.workers` | Parallel ORT sessions per model (one model copy each) | single-batch latency is fine but throughput isn't | memory is tight — each worker loads the model again |
+| `server.tokenize_threads` | Concurrent tokenizations | requests wait in tokenize while models are idle | ORT needs those cores |
+| `server.worker_threads` | tokio threads for HTTP, JSON and cache hits | cache-hit throughput is CPU-bound | almost all traffic is cold inference |
+| `models.max_batch_items` | Questions per forward pass | under load, to amortise each pass | p99 at low load matters more than throughput |
+| `models.max_batch_tokens` | Padded tokens per pass (memory per batch) | long inputs split into tiny batches | batches spike memory |
+| `models.max_wait_ms` | How long a batch waits to fill | traffic is steady and batches leave half-empty | traffic is sparse (latency is added to every cold request) |
+| `models.max_pending` | Queued questions before `529`; the sum across models also caps requests waiting to tokenize | legitimate bursts get `529` while the deadline still has room | memory is tight, or you want to shed earlier |
+| `server.request_timeout_ms` | End-to-end deadline, and so how much queueing admission allows | clients can wait longer | clients should fail fast and retry elsewhere |
+| `keys.rps` / `keys.burst` | Per-client share of capacity (a batch item costs one token) | a client is throttled below what the box can serve | one client can crowd out others |
+| `cache.l1_max_bytes` / `l1_ttl_secs` | In-process answer cache | repeats miss because entries were evicted | memory is tight |
+| `cache.redis_url` | Shared L2 cache and idempotency across instances | you run more than one instance | — |
+
+- **CPU budget:** `Σ(workers × intra_op_threads) + tokenize_threads + worker_threads ≈ vCPUs`. Giving the busier model
+  more `intra_op_threads` usually beats adding `workers`. The 10-core M1 Pro stress config uses english `6`,
   multilingual `2`, tokenize `1`, HTTP `2` ([`stress/rsdecider.stress.toml`](./stress/rsdecider.stress.toml)).
-- **`max_pending ≈ items/s × 1–2 s`.** It bounds memory (the sum across models also caps requests waiting to tokenize); latency is protected separately because admission estimates
-  queue time (EMA seconds/item × depth ÷ workers) and returns `529` up front when work can't finish by the deadline.
-- **GPU:** build with `cargo build --release --features cuda` and set `execution_provider = "cuda"`.
-- **More than one instance:** set `redis_url` so the cache and idempotency are shared.
+- **`max_pending ≈ items/s × 1–2 s`.** Latency is protected separately: admission estimates queue time
+  (EMA seconds/item × depth ÷ workers) and returns `529` up front when work can't finish by the deadline.
+- **Biggest lever:** cold capacity is inference-bound, so an int8 export (`tools/export_onnx.py --quantize int8`) or a
+  GPU (`cargo build --release --features cuda`, `execution_provider = "cuda"`) beats any server knob.
+
+<details>
+<summary><b>Fixed in code</b> (change the constant and rebuild)</summary>
+
+| Constant | Value | Where |
+|---|---|---|
+| In-process idempotency store | 64 MiB | `src/idempotency.rs` `LOCAL_MAX_BYTES` |
+| Largest stored idempotent response | 256 KiB; larger ones re-run on repeat | `src/idempotency.rs` `MAX_STORED_BYTES` |
+| Redis command timeout | 250 ms (then falls back to local) | `src/cache.rs` `REDIS_TIMEOUT` |
+| `Retry-After` on `529` | 1 s | `src/api.rs` |
+</details>
 
 ## Self-hosted (Docker)
 
