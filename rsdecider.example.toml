@@ -22,6 +22,8 @@ path = "models/english"   # model.onnx + tokenizer.json + laya.json (tools/expor
 execution_provider = "cpu" # or "cuda" (build with --features cuda)
 workers = 1               # ORT sessions, one per blocking thread
 intra_op_threads = 6
+# Size max_pending ≈ items/s × 1-2 s. It is a memory bound; latency is handled by admission, which
+# returns 529 up front when the queued work (EMA s/item × depth / workers) cannot finish by the deadline.
 max_pending = 256         # queue bound in questions; beyond this → 529
 max_batch_items = 8
 max_batch_tokens = 8192

@@ -156,11 +156,15 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/v1/decide", post(decide))
         .route("/v1/decide/batch", post(decide_batch))
         .route("/healthz", get(|| async { "ok" }))
-        // Models load before the listener binds, so a serving process is ready.
-        .route("/readyz", get(|| async { "ready" }))
+        .route("/readyz", get(readyz))
         .layer(DefaultBodyLimit::max(st.cfg.limits.max_body_bytes))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(st)
+}
+
+/// Models load before the listener binds; after that, ready while every model has a live worker.
+async fn readyz(State(st): State<Arc<AppState>>) -> (StatusCode, &'static str) {
+    if st.sched.ready() { (StatusCode::OK, "ready") } else { (StatusCode::SERVICE_UNAVAILABLE, "not ready") }
 }
 
 async fn decide(State(st): State<Arc<AppState>>, headers: HeaderMap, body: Result<Bytes, BytesRejection>) -> Response {

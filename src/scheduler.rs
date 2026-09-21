@@ -5,7 +5,7 @@ use crate::model::sequence::Encoded;
 use futures::future::{FutureExt, Shared, WeakShared};
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::time::{Duration, Instant};
@@ -101,6 +101,10 @@ struct ModelQueue {
     max_pending: usize,
     permits: Arc<Semaphore>,
     tx: mpsc::UnboundedSender<WorkItem>,
+    workers: usize,
+    live: Arc<AtomicUsize>,
+    /// EMA of inference seconds per item, as f64 bits; 0.0 = no estimate yet.
+    secs_per_item: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -123,6 +127,9 @@ impl Scheduler {
             let (work_tx, work_rx) = std_mpsc::sync_channel::<Dispatch>(spec.workers);
             let work_rx = Arc::new(Mutex::new(work_rx));
             let (ready_tx, ready_rx) = std_mpsc::channel();
+            let idle = Arc::new(Semaphore::new(spec.workers));
+            let live = Arc::new(AtomicUsize::new(spec.workers));
+            let secs_per_item = Arc::new(AtomicU64::new(0));
             for w in 0..spec.workers {
                 let ctx = WorkerCtx {
                     name: spec.name.clone(),
@@ -133,6 +140,9 @@ impl Scheduler {
                     rt: rt.clone(),
                     permits: permits.clone(),
                     max_pending: spec.max_pending,
+                    idle: idle.clone(),
+                    live: live.clone(),
+                    secs_per_item: secs_per_item.clone(),
                 };
                 let ready = ready_tx.clone();
                 std::thread::Builder::new()
@@ -144,10 +154,23 @@ impl Scheduler {
                 ready_rx.recv().map_err(|_| format!("model {}: worker exited during startup", spec.name))??;
             }
             let limits = (spec.max_batch_items, spec.max_batch_tokens, spec.max_wait);
-            rt.spawn(batcher(rx, limits, Arc::new(Semaphore::new(spec.workers)), work_tx));
-            models.push(ModelQueue { name: spec.name, max_pending: spec.max_pending, permits, tx });
+            rt.spawn(batcher(rx, limits, idle, work_tx));
+            models.push(ModelQueue {
+                name: spec.name,
+                max_pending: spec.max_pending,
+                permits,
+                tx,
+                workers: spec.workers,
+                live,
+                secs_per_item,
+            });
         }
         Ok(Self { map, models: Arc::new(models), next_gen: Arc::default() })
+    }
+
+    /// Every model has at least one live worker.
+    pub fn ready(&self) -> bool {
+        self.models.iter().all(|q| q.live.load(Ordering::Relaxed) > 0)
     }
 
     /// Runs every job (unique keys) to completion, coalescing with identical in-flight work.
@@ -213,6 +236,14 @@ impl Scheduler {
                     continue;
                 }
                 let q = &self.models[m];
+                // Shed now if the queue ahead cannot drain before the deadline (fast 529, not a late 504).
+                let spi = f64::from_bits(q.secs_per_item.load(Ordering::Relaxed));
+                let queued = q.max_pending - q.permits.available_permits() + n as usize;
+                let left = deadline.saturating_duration_since(Instant::now()).as_secs_f64();
+                if spi > 0.0 && queued as f64 * spi / q.workers as f64 > left {
+                    metrics::counter!("rsdecider_shed_total", "model" => q.name.clone()).increment(1);
+                    return Err(SchedError::Overloaded);
+                }
                 match q.permits.clone().try_acquire_many_owned(n) {
                     Ok(p) => permits.push(Some(p)),
                     Err(_) => {
@@ -310,6 +341,9 @@ struct WorkerCtx {
     rt: tokio::runtime::Handle,
     permits: Arc<Semaphore>,
     max_pending: usize,
+    idle: Arc<Semaphore>,
+    live: Arc<AtomicUsize>,
+    secs_per_item: Arc<AtomicU64>,
 }
 
 fn worker(ctx: WorkerCtx, ready: std_mpsc::Sender<Result<(), String>>) {
@@ -325,16 +359,21 @@ fn worker(ctx: WorkerCtx, ready: std_mpsc::Sender<Result<(), String>>) {
     };
     loop {
         let msg = ctx.rx.lock().unwrap().recv();
-        let Ok((items, _idle)) = msg else { return };
+        let Ok((items, idle_permit)) = msg else { return };
         let batch = Batch { items: items.iter().map(|i| i.enc.clone()).collect(), pad_id: ctx.pad_id };
         let started = std::time::Instant::now();
         let result = catch_unwind(AssertUnwindSafe(|| backend.run(&batch)));
-        metrics::histogram!("rsdecider_inference_seconds", "model" => ctx.name.clone())
-            .record(started.elapsed().as_secs_f64());
+        let batch_secs = started.elapsed().as_secs_f64();
+        metrics::histogram!("rsdecider_inference_seconds", "model" => ctx.name.clone()).record(batch_secs);
         metrics::histogram!("rsdecider_batch_size", "model" => ctx.name.clone()).record(items.len() as f64);
         let mut panicked = false;
         let failure = match result {
             Ok(Ok(raws)) if raws.len() == items.len() => {
+                let x = batch_secs / items.len() as f64;
+                let _ = ctx.secs_per_item.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+                    let old = f64::from_bits(b);
+                    Some(if old == 0.0 { x } else { 0.8 * old + 0.2 * x }.to_bits())
+                });
                 for (mut item, raw) in items.into_iter().zip(raws) {
                     let (key, raw) = (item.key, Arc::new(raw));
                     ctx.cache.put_l1(key, raw.clone()); // L1 before the entry disappears
@@ -367,6 +406,12 @@ fn worker(ctx: WorkerCtx, ready: std_mpsc::Sender<Result<(), String>>) {
                 Ok(b) => backend = b,
                 Err(e) => {
                     tracing::error!(model = %ctx.name, "worker retired, rebuild failed: {e}");
+                    // One fewer idle slot, so the batcher never hands a batch to nobody; the last
+                    // worker closes it, which stops the batcher and fails new work fast.
+                    idle_permit.forget();
+                    if ctx.live.fetch_sub(1, Ordering::Relaxed) == 1 {
+                        ctx.idle.close();
+                    }
                     return;
                 }
             }
@@ -542,12 +587,31 @@ mod tests {
         let s = sched(vec![ModelSpec { factory, ..spec("m", &Fake::default(), 4, 8, 8192) }]).await;
         let r = s.run_jobs(vec![job(7, 0, 4)], secs(5)).await;
         assert_eq!(r.unwrap_err(), SchedError::Backend("inference worker panicked".into()));
+        assert!(!s.ready(), "a model with no live workers is not ready");
         let started = Instant::now();
         let r = s.run_jobs(vec![job(1, 0, 4)], secs(5)).await;
         assert_eq!(r.unwrap_err(), SchedError::Backend("model workers unavailable".into()));
         assert!(started.elapsed() < Duration::from_secs(1), "failed fast, not at the deadline");
         assert!(s.map.lock().unwrap().is_empty());
         assert_eq!(s.models[0].permits.available_permits(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unmeetable_deadline_is_shed_immediately() {
+        let fake = Fake { delay: Duration::from_millis(100), ..Fake::default() };
+        let s = sched(vec![spec("m", &fake, 64, 1, 8192)]).await;
+        assert!(s.ready());
+        s.run_jobs(vec![job(1, 0, 4)], secs(5)).await.unwrap(); // seeds the estimate: ~0.1 s/item
+        let busy = {
+            let s = s.clone();
+            tokio::spawn(async move { s.run_jobs((2..7).map(|n| job(n, 0, 4)).collect(), secs(5)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await; // 5 items queued: ~0.5 s of work
+        let started = Instant::now();
+        let r = s.run_jobs(vec![job(9, 0, 4)], Instant::now() + Duration::from_millis(300)).await;
+        assert_eq!(r.unwrap_err(), SchedError::Overloaded);
+        assert!(started.elapsed() < Duration::from_millis(50), "shed at admission, not at the deadline");
+        busy.await.unwrap().unwrap();
     }
 
     #[tokio::test]
