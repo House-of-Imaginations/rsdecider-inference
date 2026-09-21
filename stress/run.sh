@@ -4,10 +4,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 out="results/$(date +%F).md"
 { echo "# Stress run $(date -Iseconds)"; echo; echo "Host: $(uname -srm), $(getconf _NPROCESSORS_ONLN) vCPU"; echo; } > "$out"
-# Arrival rates (req/s) per scenario; defaults suit a real CPU model (see rsdecider.stress.toml).
+# Arrival rates (req/s). cold=3 is inside M1 Pro capacity (~3 cold req/s, see results/2026-09-21-m1pro.md);
+# mixed/batch/overload defaults deliberately exceed it, so their k6 thresholds fail on 529s by design.
 rate() {
   case "$1" in
-    cold) echo "${COLD_RATE:-20}" ;;
+    cold) echo "${COLD_RATE:-3}" ;;
     hot) echo "${HOT_RATE:-3000}" ;;
     mixed) echo "${MIXED_RATE:-60}" ;;
     batch) echo "${BATCH_RATE:-5}" ;;
