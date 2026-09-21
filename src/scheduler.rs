@@ -3,7 +3,7 @@ use crate::cache::{Cache, Key};
 use crate::model::postprocess::Raw;
 use crate::model::sequence::Encoded;
 use futures::future::{FutureExt, Shared, WeakShared};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
@@ -289,51 +289,66 @@ impl Scheduler {
     }
 }
 
-/// Step 6: collect up to max items / max tokens / max wait, but only once a worker is idle, so
-/// surplus work stays in the queue where it can still be skipped.
+/// Step 6: once a worker is idle, collect up to max items / max wait (plus everything already queued),
+/// then dispatch the oldest item with the buffered items closest to its length (less padding).
+/// Surplus work stays buffered where it can still be skipped.
 async fn batcher(
     mut rx: mpsc::UnboundedReceiver<WorkItem>,
     (max_items, max_tokens, max_wait): (usize, usize, Duration),
     idle: Arc<Semaphore>,
     work: std_mpsc::SyncSender<Dispatch>,
 ) {
-    let mut carry: Option<WorkItem> = None;
+    // Bounded by `max_pending`: every buffered item holds a permit.
+    let mut buf: VecDeque<WorkItem> = VecDeque::new();
     loop {
         let Ok(idle_permit) = idle.clone().acquire_owned().await else { return };
-        let first = match carry.take() {
-            Some(i) => i,
-            None => match rx.recv().await {
-                Some(i) => i,
+        if buf.is_empty() {
+            match rx.recv().await {
+                Some(i) => buf.push_back(i),
                 None => return,
-            },
-        };
-        // ORT allocates batch × longest, so the cap applies to the padded size
-        let mut longest = first.enc.ids.len();
-        let mut batch = vec![first];
+            }
+        }
         let close = Instant::now() + max_wait;
-        while batch.len() < max_items {
+        while buf.len() < max_items {
             let Ok(Some(item)) = tokio::time::timeout_at(close, rx.recv()).await else { break };
-            if !item.live(Instant::now()) {
-                continue; // dropped here: entry removed, permit released
-            }
-            let len = longest.max(item.enc.ids.len());
-            if (batch.len() + 1) * len > max_tokens {
-                carry = Some(item);
-                break;
-            }
-            longest = len;
-            batch.push(item);
+            buf.push_back(item);
+        }
+        while let Ok(item) = rx.try_recv() {
+            buf.push_back(item); // everything already queued is a candidate
         }
         let now = Instant::now();
-        batch.retain(|i| i.live(now));
-        if batch.is_empty() {
-            continue;
-        }
+        buf.retain(|i| i.live(now)); // dropped here: entry removed, permit released
+        let Some(first) = buf.pop_front() else { continue };
+        let batch = pick(first, &mut buf, max_items, max_tokens);
         // Never blocks: at most `workers` idle permits exist and the channel holds `workers`.
         if work.send((batch, idle_permit)).is_err() {
             return;
         }
     }
+}
+
+/// The oldest item, then the buffered items closest to its length, under the padded-token cap
+/// (ORT allocates batch × longest).
+fn pick(first: WorkItem, buf: &mut VecDeque<WorkItem>, max_items: usize, max_tokens: usize) -> Vec<WorkItem> {
+    let target = first.enc.ids.len();
+    let mut order: Vec<usize> = (0..buf.len()).collect();
+    order.sort_by_key(|&i| (buf[i].enc.ids.len().abs_diff(target), i));
+    let (mut longest, mut chosen) = (target, Vec::new());
+    for i in order {
+        if chosen.len() + 1 >= max_items {
+            break;
+        }
+        let len = longest.max(buf[i].enc.ids.len());
+        if (chosen.len() + 2) * len <= max_tokens {
+            longest = len;
+            chosen.push(i);
+        }
+    }
+    // Highest index first, so earlier removals don't shift the ones still to come.
+    chosen.sort_unstable_by(|a, b| b.cmp(a));
+    let mut batch = vec![first];
+    batch.extend(chosen.into_iter().map(|i| buf.remove(i).expect("index in range")));
+    batch
 }
 
 struct WorkerCtx {
@@ -564,6 +579,41 @@ mod tests {
         // 16 + 2 = 18 raw tokens, but padded together they are 2 × 16 = 32 > 20
         s.run_jobs(vec![job(1, 0, 16), job(2, 0, 2)], secs(5)).await.unwrap();
         assert_eq!(*fake.batch_sizes.lock().unwrap(), [1, 1]);
+    }
+
+    fn item(len: usize) -> WorkItem {
+        let (tx, _) = oneshot::channel();
+        WorkItem {
+            key: [0; 32],
+            generation: 0,
+            enc: job(1, 0, len).enc,
+            tx: Some(tx),
+            deadline: Arc::new(Mutex::new(Instant::now())),
+            map: Arc::default(),
+            _permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+        }
+    }
+
+    fn lens<'a>(items: impl IntoIterator<Item = &'a WorkItem>) -> Vec<usize> {
+        items.into_iter().map(|i| i.enc.ids.len()).collect()
+    }
+
+    #[test]
+    fn pick_groups_similar_lengths_oldest_first() {
+        let mut buf: VecDeque<WorkItem> = [500, 12, 480, 11, 490].into_iter().map(item).collect();
+        let batch = pick(item(10), &mut buf, 3, 8192);
+        assert_eq!(lens(&batch), [10, 11, 12], "the oldest leads, then the closest lengths");
+        assert_eq!(lens(&buf), [500, 480, 490], "the rest stay buffered in arrival order");
+        let batch = pick(buf.pop_front().unwrap(), &mut buf, 3, 8192);
+        assert_eq!(lens(&batch), [500, 490, 480]);
+    }
+
+    #[test]
+    fn pick_respects_the_padded_token_cap() {
+        let mut buf: VecDeque<WorkItem> = [12, 11].into_iter().map(item).collect();
+        // 10 + 11 pad to 2 × 11 = 22 <= 30; adding 12 would pad to 3 × 12 = 36.
+        assert_eq!(lens(&pick(item(10), &mut buf, 8, 30)), [10, 11]);
+        assert_eq!(lens(&buf), [12]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
