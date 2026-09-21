@@ -1,21 +1,24 @@
-// k6 run -e SCENARIO=cold|hot|mixed|batch|overload -e RATE=200 stress/scenario.js
+// k6 run -e SCENARIO=cold|hot|mixed|batch|overload -e RATE=20 stress/scenario.js (run.sh sets RATE per scenario)
 import { post, questions, state, zipf, ramp } from './lib.js';
 
 const S = __ENV.SCENARIO || 'mixed';
-const RATE = Number(__ENV.RATE || (S === 'overload' ? 2000 : 200));
+const DEFAULT_RATE = { cold: 20, hot: 3000, mixed: 60, batch: 5, overload: 100 };
+const RATE = Number(__ENV.RATE || DEFAULT_RATE[S]);
+const ACCEPTED = 'http_req_duration{expected_response:true}';
 
 export const options = {
   scenarios: { [S]: ramp(RATE, '2m') },
   thresholds: S === 'overload'
-    ? { checks: ['rate>0.99'] } // only 200 or 529, never 5xx/timeouts
-    : { http_req_failed: ['rate<0.01'], 'http_req_duration{path:/v1/decide}': ['p(99)<1000'] },
+    // only 200 or 529, never 5xx/504; accepted requests finish inside the 10 s deadline
+    ? { checks: ['rate>0.99'], [ACCEPTED]: ['p(99)<10000'], dropped_iterations: ['rate<1'] }
+    : { http_req_failed: ['rate<0.01'], [ACCEPTED]: ['p(99)<1000'], dropped_iterations: ['rate<1'] },
 };
 
 export default function () {
   const i = __ITER + __VU * 1e6;
-  if (S === 'cold') post('/v1/decide', { state: state(i), questions: questions() });
+  if (S === 'cold' || S === 'overload') post('/v1/decide', { state: state(i), questions: questions() });
   else if (S === 'hot') post('/v1/decide', { state: state(0), questions: questions() });
-  else if (S === 'mixed' || S === 'overload') post('/v1/decide', { state: state(zipf(1000)), questions: questions() });
+  else if (S === 'mixed') post('/v1/decide', { state: state(zipf(100000)), questions: questions() });
   else if (S === 'batch') post('/v1/decide/batch', {
     items: Array.from({ length: 8 }, (_, k) => ({ state: state(i * 8 + k), questions: questions() })),
   });

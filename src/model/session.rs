@@ -63,6 +63,8 @@ impl OrtBackend {
             Session::builder()?
                 .with_optimization_level(GraphOptimizationLevel::Level3)?
                 .with_intra_threads(intra_threads)?
+                // Two sessions plus tokio would otherwise spin-steal the fast cores between batches.
+                .with_intra_op_spinning(false)?
                 .with_execution_providers([ep])?
                 .commit_from_file(model_onnx)
         };

@@ -1,0 +1,50 @@
+# Stress config for an 8P+2E-core, 16 GB box with both real models (see stress/run.sh).
+# Key "stress" = sha256("stress-key"), the default RSD_KEY in stress/lib.js.
+[server]
+listen = "0.0.0.0:3000"
+metrics_listen = "127.0.0.1:9000"
+worker_threads = 2
+tokenize_threads = 1
+request_timeout_ms = 10000
+
+[limits]
+max_body_bytes = 1048576
+max_state_chars = 100000
+max_batch_states = 8
+max_questions_per_state = 4
+
+[routing]
+english_model = "english"
+non_english_model = "multilingual"
+
+[[models]]
+name = "english"
+path = "models/english"
+workers = 1
+intra_op_threads = 6
+max_pending = 48
+max_batch_items = 8
+max_batch_tokens = 8192
+max_wait_ms = 2
+
+[[models]]
+name = "multilingual"
+path = "models/multilingual"
+workers = 1
+intra_op_threads = 2
+max_pending = 64
+max_batch_items = 8
+max_batch_tokens = 8192
+max_wait_ms = 2
+
+[cache]
+l1_max_bytes = 268435456
+l1_ttl_secs = 3600
+l2_ttl_secs = 86400
+idempotency_ttl_secs = 86400
+
+[[keys]]
+name = "stress"
+sha256 = "6a3c65679a6c247316cbd7301e5677b16f96838401263c2c35727dfe989ffb8d"
+rps = 100000
+burst = 100000

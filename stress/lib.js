@@ -14,8 +14,13 @@ export function questions() {
   };
 }
 
+// ~25% non-English (Vietnamese, Spanish) so routing and the multilingual model get load.
 export function state(i) {
-  return `Ticket ${i}: customer was charged twice for their order and asks for a refund within the week.`;
+  switch (i % 8) {
+    case 3: return `Phiếu ${i}: khách hàng bị tính tiền hai lần cho đơn hàng và yêu cầu được hoàn tiền trong tuần này.`;
+    case 7: return `Ticket ${i}: el cliente recibió dos cargos por su pedido y solicita un reembolso durante esta semana.`;
+    default: return `Ticket ${i}: customer was charged twice for their order and asks for a refund within the week.`;
+  }
 }
 
 // Zipf-ish over n states: small ids dominate, so ~70% of requests repeat a hot state.
