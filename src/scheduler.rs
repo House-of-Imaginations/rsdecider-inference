@@ -49,6 +49,9 @@ pub enum SchedError {
     Backend(String),
 }
 
+/// Rounds of "joined a dying entry" re-admission before giving up (bounds a hot retry loop).
+const MAX_READMITS: u32 = 3;
+
 type Outcome = Result<Arc<Raw>, String>;
 type Sub = Shared<oneshot::Receiver<Outcome>>;
 type Map = Arc<Mutex<HashMap<Key, Entry>>>;
@@ -150,7 +153,11 @@ impl Scheduler {
     /// Runs every job (unique keys) to completion, coalescing with identical in-flight work.
     pub async fn run_jobs(&self, jobs: Vec<Job>, deadline: Instant) -> Result<HashMap<Key, Arc<Raw>>, SchedError> {
         let mut todo: HashMap<Key, Job> = jobs.into_iter().map(|j| (j.key, j)).collect();
+        if todo.values().any(|j| j.model >= self.models.len()) {
+            return Err(SchedError::Backend("unknown model index".into())); // before the map lock
+        }
         let mut done = HashMap::with_capacity(todo.len());
+        let mut readmits = 0;
         while !todo.is_empty() {
             if Instant::now() >= deadline {
                 return Err(SchedError::Deadline);
@@ -158,6 +165,7 @@ impl Scheduler {
             let subs = self.admit(todo.values(), deadline)?;
             let waits = futures::future::join_all(subs.into_iter().map(|(k, s)| async move { (k, s.await) }));
             let results = tokio::time::timeout_at(deadline, waits).await.map_err(|_| SchedError::Deadline)?;
+            let mut dropped = false;
             for (k, r) in results {
                 match r {
                     Ok(Ok(raw)) => {
@@ -165,7 +173,13 @@ impl Scheduler {
                         done.insert(k, raw);
                     }
                     Ok(Err(e)) => return Err(SchedError::Backend(e)),
-                    Err(_) => {} // item dropped without a result (joined a dying entry): admit again
+                    Err(_) => dropped = true, // item dropped without a result (joined a dying entry): admit again
+                }
+            }
+            if dropped {
+                readmits += 1;
+                if readmits > MAX_READMITS {
+                    return Err(SchedError::Backend("work items dropped without a result".into()));
                 }
             }
         }
@@ -232,8 +246,11 @@ impl Scheduler {
                 map: self.map.clone(),
                 _permit: permit,
             };
-            // A send error means the batcher is gone (shutdown); dropping the item cleans up.
-            let _ = self.models[job.model].tx.send(item);
+            // A send error means the batcher is gone (shutdown, or every worker retired): fail
+            // subscribers now instead of letting them re-admit until the deadline.
+            if let Err(mpsc::error::SendError(mut item)) = self.models[job.model].tx.send(item) {
+                item.finish(Err("model workers unavailable".into()));
+            }
         }
         Ok(subs)
     }
@@ -510,6 +527,34 @@ mod tests {
         assert_eq!(fake.items.load(SeqCst), 1);
         assert!(s.map.lock().unwrap().is_empty());
         assert_eq!(s.models[0].permits.available_permits(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dead_model_fails_fast_with_backend_error() {
+        let fake = Fake { panic_token: Some(7), ..Fake::default() };
+        let built = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let factory: BackendFactory =
+            Arc::new(
+                move || {
+                    if built.swap(true, SeqCst) { Err("rebuild failed".into()) } else { Ok(Box::new(fake.clone())) }
+                },
+            );
+        let s = sched(vec![ModelSpec { factory, ..spec("m", &Fake::default(), 4, 8, 8192) }]).await;
+        let r = s.run_jobs(vec![job(7, 0, 4)], secs(5)).await;
+        assert_eq!(r.unwrap_err(), SchedError::Backend("inference worker panicked".into()));
+        let started = Instant::now();
+        let r = s.run_jobs(vec![job(1, 0, 4)], secs(5)).await;
+        assert_eq!(r.unwrap_err(), SchedError::Backend("model workers unavailable".into()));
+        assert!(started.elapsed() < Duration::from_secs(1), "failed fast, not at the deadline");
+        assert!(s.map.lock().unwrap().is_empty());
+        assert_eq!(s.models[0].permits.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn unknown_model_index_is_rejected() {
+        let s = sched(vec![spec("m", &Fake::default(), 4, 8, 8192)]).await;
+        assert!(matches!(s.run_jobs(vec![job(1, 5, 4)], secs(5)).await, Err(SchedError::Backend(_))));
+        assert_eq!(s.run_jobs(vec![job(1, 0, 4)], secs(5)).await.map(|m| m.len()), Ok(1), "map lock not poisoned");
     }
 
     #[tokio::test]
