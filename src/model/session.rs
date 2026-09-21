@@ -1,7 +1,7 @@
 //! ORT backend: one `Session` per worker thread (`Session::run` takes `&mut self`).
 use super::postprocess::Raw;
 use crate::scheduler::{Backend, Batch};
-use ort::session::{Session, builder::GraphOptimizationLevel};
+use ort::session::{RunOptions, Session, builder::GraphOptimizationLevel};
 use ort::value::Tensor;
 use std::path::Path;
 
@@ -49,27 +49,47 @@ pub fn pad(batch: &Batch) -> Padded {
 
 pub struct OrtBackend {
     session: Session,
+    run_opts: Option<RunOptions>,
 }
 
 impl OrtBackend {
-    pub fn new(model_onnx: &Path, execution_provider: &str, intra_threads: usize) -> Result<Self, String> {
+    pub fn new(
+        model_onnx: &Path,
+        execution_provider: &str,
+        intra_threads: usize,
+        arena_shrink: bool,
+        global_pool: bool,
+    ) -> Result<Self, String> {
         let ep = match execution_provider {
-            "cpu" => ort::ep::CPU::default().build(),
+            // ort's CPU EP defaults to no arena; the shrink RunOption needs one registered to shrink.
+            "cpu" => ort::ep::CPU::default().with_arena_allocator(arena_shrink).build(),
             #[cfg(feature = "cuda")]
             "cuda" => ort::ep::CUDA::default().with_device_id(0).build(),
             other => return Err(format!("execution provider {other:?} is not available in this build")),
         };
         let build = || -> ort::Result<Session> {
-            Session::builder()?
+            let b = Session::builder()?
                 .with_optimization_level(GraphOptimizationLevel::Level3)?
-                .with_intra_threads(intra_threads)?
-                // Two sessions plus tokio would otherwise spin-steal the fast cores between batches.
-                .with_intra_op_spinning(false)?
-                .with_execution_providers([ep])?
-                .commit_from_file(model_onnx)
+                // Dynamic batch size: a fixed memory pattern would pin the arena to the first batch shape seen.
+                .with_memory_pattern(false)?;
+            let b = if global_pool {
+                b
+            } else {
+                b.with_intra_threads(intra_threads)?
+                    // Two sessions plus tokio would otherwise spin-steal the fast cores between batches.
+                    .with_intra_op_spinning(false)?
+            };
+            b.with_execution_providers([ep])?.commit_from_file(model_onnx)
         };
         let session = build().map_err(|e| format!("{}: {e}", model_onnx.display()))?;
-        Ok(Self { session })
+        let run_opts = if arena_shrink {
+            let mut o = RunOptions::new().map_err(|e| e.to_string())?;
+            o.set("memory.enable_memory_arena_shrinkage", "cpu:0").map_err(|e| e.to_string())?;
+            Some(o)
+        } else {
+            None
+        };
+        Ok(Self { session, run_opts })
     }
 }
 
@@ -77,16 +97,18 @@ impl Backend for OrtBackend {
     fn run(&mut self, batch: &Batch) -> Result<Vec<Raw>, String> {
         let p = pad(batch);
         let t = |shape: Vec<usize>, data: Vec<i64>| Tensor::from_array((shape, data)).map_err(|e| e.to_string());
-        let outs = self
-            .session
-            .run(ort::inputs![
-                "input_ids" => t(vec![p.b, p.l], p.input_ids)?,
-                "attention_mask" => t(vec![p.b, p.l], p.attention_mask)?,
-                "type_ids" => t(vec![p.b], p.type_ids)?,
-                "marker_pos" => t(vec![p.b, p.k], p.marker_pos)?,
-                "marker_mask" => t(vec![p.b, p.k], p.marker_mask)?,
-            ])
-            .map_err(|e| e.to_string())?;
+        let inputs = ort::inputs![
+            "input_ids" => t(vec![p.b, p.l], p.input_ids)?,
+            "attention_mask" => t(vec![p.b, p.l], p.attention_mask)?,
+            "type_ids" => t(vec![p.b], p.type_ids)?,
+            "marker_pos" => t(vec![p.b, p.k], p.marker_pos)?,
+            "marker_mask" => t(vec![p.b, p.k], p.marker_mask)?,
+        ];
+        let outs = match &self.run_opts {
+            Some(o) => self.session.run_with_options(inputs, o),
+            None => self.session.run(inputs),
+        }
+        .map_err(|e| e.to_string())?;
         let (_, logits) = outs["logits"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
         let (_, act) = outs["act_prob"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
         Ok(batch
