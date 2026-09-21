@@ -73,9 +73,10 @@ impl Cache {
         self.l1.insert(k, v);
     }
 
-    /// L1, then L2 (promoting hits to L1). Redis errors count as misses.
-    pub async fn get(&self, k: &Key) -> Option<(Arc<Raw>, Tier)> {
-        if let Some(v) = self.l1.get(k) {
+    /// L1, then L2 (promoting hits to L1). Redis errors, and values that don't decode to exactly
+    /// `n_logits` logits (a malformed L2 value would panic in postprocess), count as misses.
+    pub async fn get(&self, k: &Key, n_logits: usize) -> Option<(Arc<Raw>, Tier)> {
+        if let Some(v) = self.l1.get(k).filter(|v| v.logits.len() == n_logits) {
             return Some((v, Tier::L1));
         }
         let mut con = self.redis.clone()?;
@@ -92,7 +93,17 @@ impl Cache {
                 return None;
             }
         };
-        let raw: Arc<Raw> = Arc::new(serde_json::from_str(&s).ok()?);
+        let raw: Arc<Raw> = match serde_json::from_str::<Raw>(&s) {
+            Ok(r) if r.logits.len() == n_logits => Arc::new(r),
+            Ok(r) => {
+                redis_error(format!("malformed cached value: {} logits, want {n_logits}", r.logits.len()));
+                return None;
+            }
+            Err(e) => {
+                redis_error(format!("malformed cached value: {e}"));
+                return None;
+            }
+        };
         self.l1.insert(*k, raw.clone());
         Some((raw, Tier::L2))
     }
@@ -139,9 +150,17 @@ mod tests {
     async fn l1_roundtrip_without_redis() {
         let c = Cache::new(&CacheCfg::default()).await.unwrap();
         let k = key(&FP, QType::Noul, &["x"]);
-        assert!(c.get(&k).await.is_none());
+        assert!(c.get(&k, 2).await.is_none());
         c.put_l1(k, Arc::new(Raw { logits: vec![0.1, 0.2], act_prob: 0.5, n_tokens: 3 }));
-        let (v, tier) = c.get(&k).await.unwrap();
+        let (v, tier) = c.get(&k, 2).await.unwrap();
         assert_eq!((v.n_tokens, tier), (3, Tier::L1));
+    }
+
+    #[tokio::test]
+    async fn wrong_length_raw_is_a_miss() {
+        let c = Cache::new(&CacheCfg::default()).await.unwrap();
+        let k = key(&FP, QType::Choice, &["x"]);
+        c.put_l1(k, Arc::new(Raw { logits: vec![0.1, 0.2], act_prob: 0.5, n_tokens: 3 }));
+        assert!(c.get(&k, 3).await.is_none());
     }
 }

@@ -313,7 +313,7 @@ async fn decide_items(
     }
 
     // Step 3: cache lookup.
-    let looked = futures::future::join_all(qs.iter().map(|q| st.cache.get(&q.key))).await;
+    let looked = futures::future::join_all(qs.iter().map(|q| st.cache.get(&q.key, q.prep.options.len()))).await;
     let mut raws: HashMap<Key, (Arc<Raw>, bool)> = HashMap::new();
     for (q, hit) in qs.iter().zip(looked) {
         let tier = match hit {
