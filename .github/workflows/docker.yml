@@ -1,7 +1,8 @@
 name: docker
 
-# image build: main only
+# image build: main only (or run by hand from the Actions tab)
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths: ['self-hosted/**', 'src/**', 'openapi.yaml', 'Cargo.toml', 'Cargo.lock', '.github/workflows/docker.yml']
