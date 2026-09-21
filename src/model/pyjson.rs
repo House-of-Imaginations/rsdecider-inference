@@ -69,7 +69,9 @@ fn write_str(out: &mut String, s: &str, ascii: bool) {
 }
 
 /// Python `repr(float)`: shortest round-trip digits; scientific when the decimal exponent is < -4 or >= 16.
-pub fn float_repr(f: f64) -> String {
+/// Precondition: f.is_finite()
+pub(crate) fn float_repr(f: f64) -> String {
+    debug_assert!(f.is_finite(), "float_repr needs a finite value, got {f}");
     let sci = format!("{:e}", f); // shortest round-trip, e.g. "-1.5e16", "1e-5", "0e0"
     let (mant, exp) = sci.split_once('e').unwrap();
     let exp: i32 = exp.parse().unwrap();

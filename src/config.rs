@@ -194,10 +194,6 @@ impl Config {
         }
         Ok(())
     }
-
-    pub fn model(&self, name: &str) -> Option<&ModelCfg> {
-        self.models.iter().find(|m| m.name == name)
-    }
 }
 
 #[cfg(test)]

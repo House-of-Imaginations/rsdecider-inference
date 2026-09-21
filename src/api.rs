@@ -232,7 +232,9 @@ async fn run(
     };
     key.check(items.len() as u32).map_err(ApiError::RateLimited)?;
 
-    let guard = match headers.get("idempotency-key").and_then(|v| v.to_str().ok()) {
+    let ik = headers.get("idempotency-key").map(|v| v.to_str()).transpose();
+    let ik = ik.map_err(|_| ApiError::Invalid("Idempotency-Key must be visible ASCII".into()))?;
+    let guard = match ik {
         None => None,
         Some(ik) => {
             let body_sha = hex::encode(<[u8; 32]>::from(Sha256::digest(&body)));

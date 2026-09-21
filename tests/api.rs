@@ -195,6 +195,13 @@ async fn idempotency_never_replays_errors() {
 }
 
 #[tokio::test]
+async fn non_ascii_idempotency_key_is_rejected() {
+    let (app, _) = app(config(|_| {}), &Fake::default()).await;
+    let h = [auth(), ("idempotency-key", "clé")];
+    assert_eq!(call(&app, "/v1/decide", decide_body("x", "q"), &h).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
 async fn batch_routes_each_item_independently() {
     let (app, _) = app(config(|_| {}), &Fake::default()).await;
     let french = "Le client a été facturé deux fois et il demande un remboursement pour la facture qui a été payée le mois dernier avec la carte de crédit";
