@@ -236,11 +236,13 @@ impl Scheduler {
                     continue;
                 }
                 let q = &self.models[m];
-                // Shed now if the queue ahead cannot drain before the deadline (fast 529, not a late 504).
+                // Shed now if the work already queued ahead cannot drain before the deadline (fast 529,
+                // not a late 504). Only work ahead counts: an idle queue always admits, so a stale high
+                // estimate can't shed large requests forever.
                 let spi = f64::from_bits(q.secs_per_item.load(Ordering::Relaxed));
-                let queued = q.max_pending - q.permits.available_permits() + n as usize;
+                let ahead = q.max_pending - q.permits.available_permits();
                 let left = deadline.saturating_duration_since(Instant::now()).as_secs_f64();
-                if spi > 0.0 && queued as f64 * spi / q.workers as f64 > left {
+                if spi > 0.0 && ahead > 0 && ahead as f64 * spi / q.workers as f64 > left {
                     metrics::counter!("rsdecider_shed_total", "model" => q.name.clone()).increment(1);
                     return Err(SchedError::Overloaded);
                 }
@@ -612,6 +614,16 @@ mod tests {
         assert_eq!(r.unwrap_err(), SchedError::Overloaded);
         assert!(started.elapsed() < Duration::from_millis(50), "shed at admission, not at the deadline");
         busy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn large_request_on_idle_queue_is_admitted_despite_high_estimate() {
+        let fake = Fake { delay: Duration::from_millis(200), ..Fake::default() };
+        let s = sched(vec![spec("m", &fake, 64, 8, 8192)]).await;
+        s.run_jobs(vec![job(1, 0, 4)], secs(5)).await.unwrap(); // slow lone batch: ~0.2 s/item estimate
+        let jobs: Vec<Job> = (2..10).map(|n| job(n, 0, 4)).collect(); // 8 × 0.2 s > 1 s, but it is one batch
+        let r = s.run_jobs(jobs, Instant::now() + Duration::from_secs(1)).await;
+        assert_eq!(r.map(|m| m.len()), Ok(8), "nothing queued ahead, so nothing to shed for");
     }
 
     #[tokio::test]
