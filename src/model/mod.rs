@@ -1,3 +1,4 @@
+pub mod postprocess;
 pub mod pyjson;
 pub mod sequence;
 
