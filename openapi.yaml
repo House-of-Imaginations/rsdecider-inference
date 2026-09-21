@@ -279,6 +279,6 @@ components:
       description: The request passed server.request_timeout_ms
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     Overloaded:
-      description: The tokenize queue is full, or the model queue cannot take these questions within the deadline; retry later
+      description: The tokenize queue is full, or the model queue can't finish the queued work plus this request before the deadline; retry later
       headers: { Retry-After: { $ref: '#/components/headers/RetryAfter' } }
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }

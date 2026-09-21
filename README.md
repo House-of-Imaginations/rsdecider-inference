@@ -79,7 +79,7 @@ The same request again returns in `0.1 ms` with `"cached": true`. A Vietnamese `
 |---|---|
 | **Laya routing mode** | Script/language detection sends English to `english`, everything else to `multilingual`; `"model"` overrides it. |
 | **Controlled concurrency** | Bounded tokenize queue and per-model queues (`max_pending`), all-or-nothing admission, deadline-aware shedding (`529` + `Retry-After`) and a fixed ORT thread budget sized to your CPUs. |
-| **Micro-batching** | Questions from concurrent requests are packed into padded batches (`max_batch_items`, `max_batch_tokens`, `max_wait_ms`). |
+| **Micro-batching** | Questions from concurrent requests are packed into padded batches, grouping similar lengths together (oldest first) to keep padding low (`max_batch_items`, `max_batch_tokens`, `max_wait_ms`). |
 | **Coalescing** | 100 identical in-flight questions run the model once. |
 | **Two-tier cache** | L1 in-process (moka, byte-bounded) and optional L2 Redis shared across instances. |
 | **API keys + rate limits** | Only SHA-256 hashes live in config; per-key token bucket (`rps`, `burst`), a batch costs one token per item. `kill -HUP` reloads `[[keys]]` without a restart. |
@@ -240,6 +240,7 @@ overloaded_retry_after_secs  = 1        # Retry-After on 529
 redis_timeout_ms             = 250      # per Redis command; then cache miss / local idempotency
 idempotency_local_max_bytes  = 67108864 # in-process idempotency store (64 MiB)
 idempotency_max_stored_bytes = 262144   # larger responses re-run on repeat (256 KiB)
+# ort_global_threads          = 4       # one shared ORT intra-op pool for every session; per-model intra_op_threads then ignored
 ```
 
 The server refuses to start on an invalid file (unknown routing target, duplicate names, zero workers, bad key hash)
@@ -269,10 +270,12 @@ first, then set the queues from the throughput you measure (the `rsdecider_*` me
 - **CPU budget:** `Σ(workers × intra_op_threads) + tokenize_threads + worker_threads ≈ vCPUs`. Giving the busier model
   more `intra_op_threads` usually beats adding `workers`. The 10-core M1 Pro stress config uses english `6`,
   multilingual `2`, tokenize `1`, HTTP `2` ([`stress/rsdecider.stress.toml`](./stress/rsdecider.stress.toml)).
-- **`max_pending ≈ items/s × 1–2 s`.** Latency is protected separately: admission estimates queue time
-  (EMA seconds/item × depth ÷ workers) and returns `529` up front when work can't finish by the deadline.
-- **Biggest lever:** cold capacity is inference-bound, so an int8 export (`tools/export_onnx.py --quantize int8`) or a
-  GPU (`cargo build --release --features cuda`, `execution_provider = "cuda"`) beats any server knob.
+- **`max_pending ≈ items/s × 1–2 s`.** Latency is protected separately: admission estimates queue time from tokens, not
+  items (EMA seconds/token × (tokens already queued + this request's own) ÷ workers), and returns `529` up front when
+  the work can't finish by the deadline.
+- **Biggest lever:** cold capacity is inference-bound, so the model beats any server knob — a GPU
+  (`cargo build --release --features cuda`, `execution_provider = "cuda"`) today; int8 (`tools/export_onnx.py
+  --quantize int8`) once an export passes the decision gate (see Small machines below).
 
 **Advanced `[knobs]`** ([`src/knobs.rs`](./src/knobs.rs)): rarely needed, but tunable without a rebuild.
 
@@ -283,6 +286,22 @@ first, then set the queues from the throughput you measure (the `rsdecider_*` me
 | `knobs.redis_timeout_ms` | `250` | Redis is remote or slow (raise) or you'd rather miss fast (lower) |
 | `knobs.idempotency_local_max_bytes` | 64 MiB | no Redis and many `Idempotency-Key` clients |
 | `knobs.idempotency_max_stored_bytes` | 256 KiB | responses are large and must still replay |
+| `knobs.ort_global_threads` | per-session `intra_op_threads` | CPU is scarce — one shared ORT intra-op pool across every session instead of one pool per session |
+
+### Small machines
+
+[`self-hosted/rsdecider.small.toml`](./self-hosted/rsdecider.small.toml) is a starting point for 2–4 vCPU / 4 GB
+boxes: 1 worker per model, 1 tokenize thread, 1 HTTP worker thread, `[knobs] ort_global_threads` set to cores − 1 (so
+2 on a 2–3 vCPU box, adjust up on 4), and smaller `max_batch_tokens` / `max_pending` so a burst can't blow the memory
+budget. Copy it, mount your models, and tune `ort_global_threads` to your core count.
+
+**RAM floor:** loading both fp32 models takes about 2.9 GB, so plan on 4 GB RAM minimum. With 2 GB, load only one
+model (drop the `[[models]]` table you don't need and point `[routing]` at the one you keep).
+
+**int8:** `tools/export_onnx.py --quantize int8` exists and now refuses to write a model whose decisions differ from
+the fp32 one. Today's models fail that check — dynamic int8 gets top-1 agreement of 12/18 (English) and 14/19
+(multilingual) against fp32 on the fixture questions — so int8 is not recommended right now. Calibrated static int8,
+fp16 and quantization-aware training are future options that might pass the gate.
 
 ## Self-hosted (Docker)
 
@@ -380,6 +399,6 @@ openapi.yaml       HTTP API
 ## Known limits
 
 - Batches are admitted all-or-nothing, so under contention large `/v1/decide/batch` calls lose to single requests.
-- The admission estimate (EMA) adapts upward quickly but has no explicit decay after a slow spell, and it costs items, not
-  tokens, so a flood of maximum-length inputs lets about 0.2% of accepted requests hit `504`.
+- The admission estimate (EMA) adapts upward quickly but has no explicit decay after a slow spell, so a flood of
+  maximum-length inputs lets about 0.2% of accepted requests hit `504`.
 - The Redis suite runs in CI (testcontainers); the Docker e2e suite needs exported models, so it runs locally only.

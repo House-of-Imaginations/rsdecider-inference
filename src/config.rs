@@ -237,7 +237,12 @@ burst = 40
 
     #[test]
     fn shipped_configs_parse() {
-        for f in ["rsdecider.example.toml", "self-hosted/rsdecider.toml", "stress/rsdecider.stress.toml"] {
+        for f in [
+            "rsdecider.example.toml",
+            "self-hosted/rsdecider.toml",
+            "self-hosted/rsdecider.small.toml",
+            "stress/rsdecider.stress.toml",
+        ] {
             Config::load(Path::new(f)).unwrap_or_else(|e| panic!("{f}: {e}"));
         }
     }

@@ -1,7 +1,14 @@
-# Mounted by self-hosted/docker-compose.yml. dev-key = "dev-key"; stress key = "stress-key".
+# 2-4 vCPU / 4 GB minimum (fp32 models; see README > Small machines for the RAM floor and why int8 isn't used).
+# Same mount layout as self-hosted/rsdecider.toml. Set ort_global_threads to cores - 1 on a 4 vCPU box.
 [server]
 listen = "0.0.0.0:3000"
 metrics_listen = "0.0.0.0:9000"
+worker_threads = 1
+tokenize_threads = 1
+
+[limits]
+max_batch_states = 4
+max_questions_per_state = 8
 
 [routing]
 english_model = "english"
@@ -10,22 +17,30 @@ non_english_model = "multilingual"
 [[models]]
 name = "english"
 path = "/models/english"
+workers = 1
+max_pending = 32
+max_batch_items = 4
+max_batch_tokens = 2048
 
 [[models]]
 name = "multilingual"
 path = "/models/multilingual"
+workers = 1
+max_pending = 32
+max_batch_items = 4
+max_batch_tokens = 2048
 
 [cache]
 redis_url = "redis://redis:6379"
 
-# Advanced limits (src/knobs.rs); these are the defaults, shown so they're easy to find.
+# Advanced limits (src/knobs.rs); these are the defaults except ort_global_threads.
 [knobs]
 # tokenize_queue = 512                  # requests tokenizing or waiting → 529 when full (default Σ max_pending)
 overloaded_retry_after_secs = 1         # Retry-After on 529
 redis_timeout_ms = 250                  # per Redis command (compose network); then miss / local idempotency
 idempotency_local_max_bytes = 67108864  # fallback store when Redis is down (64 MiB)
 idempotency_max_stored_bytes = 262144   # larger responses re-run on repeat (256 KiB)
-# ort_global_threads = 4                # one shared ORT intra-op pool for every session; per-model intra_op_threads then ignored
+ort_global_threads = 2                  # one shared ORT intra-op pool for both sessions
 
 [[keys]]
 name = "dev"
