@@ -357,13 +357,13 @@ Measured with k6 against the real fp32 models on an Apple M1 Pro (10 cores), CPU
 | Scenario | Result |
 |---|---|
 | Cache hits, 3,000 req/s offered | 2,000 req/s served, p99 **1.4 ms**, 0 errors |
-| Cold, 3 req/s × 3 questions | p99 **575 ms**, 0 errors |
+| Cold, 3 req/s × 3 questions | p99 **518 ms**, 0 errors |
 | Cold, 6 req/s | 15% shed as `529`, accepted p99 6.5 s (inside the 10 s deadline) |
-| Overload, 100 req/s (~30× capacity) | only `200` and `529` — **0 timeouts, 0 5xx**, queue drains to 0 |
-| 90k-char states, 200 req/s | tokenize queue sheds 65% up front (`529` p50 2 ms), peak RSS 2.1 GB, 0.2% `504` |
+| Overload, 100 req/s (~30× capacity) | only `200` and `529` — **0 timeouts, 0 5xx**, queue drains to 0, ~6% padding |
+| 90k-char states, 40–200 req/s | model queue sheds the excess as `529`, peak RSS 2.2 GB, 0.4–0.5% of accepted requests `504` |
 
 Cold capacity is inference-bound (~10 questions/s English, ~4/s multilingual). The biggest lever is the model, not the
-server: an int8 export (`tools/export_onnx.py --quantize int8`) or a GPU/CoreML execution provider. Full numbers:
+server: a GPU/CoreML execution provider, or an int8 export once one passes the decision gate. Full numbers:
 [`stress/results/2026-09-21-m1pro.md`](./stress/results/2026-09-21-m1pro.md). Re-run with `stress/run.sh` against a
 running server (`-e RATE=…` per scenario; see the script).
 
@@ -405,6 +405,6 @@ openapi.yaml       HTTP API
 ## Known limits
 
 - Batches are admitted all-or-nothing, so under contention large `/v1/decide/batch` calls lose to single requests.
-- The admission estimate (EMA) adapts upward quickly but has no explicit decay after a slow spell, so a flood of
-  maximum-length inputs lets about 0.2% of accepted requests hit `504`.
+- Admission costs requests per token, but under a flood of maximum-length inputs about 0.4–0.5% of accepted requests
+  still hit `504` (measured with k6 on the same host; the cause is not proven).
 - The Redis suite runs in CI (testcontainers); the Docker e2e suite needs exported models, so it runs locally only.
