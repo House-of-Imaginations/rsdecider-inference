@@ -1,6 +1,7 @@
 pub mod postprocess;
 pub mod pyjson;
 pub mod sequence;
+pub mod session;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
