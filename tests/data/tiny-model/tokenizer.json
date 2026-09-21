@@ -1,0 +1,56 @@
+{
+ "version": "1.0",
+ "truncation": null,
+ "padding": null,
+ "added_tokens": [],
+ "normalizer": {
+  "type": "Lowercase"
+ },
+ "pre_tokenizer": {
+  "type": "Whitespace"
+ },
+ "post_processor": null,
+ "decoder": null,
+ "model": {
+  "type": "WordLevel",
+  "vocab": {
+   "[UNK]": 0,
+   "[CLS]": 1,
+   "[SEP]": 2,
+   "[PAD]": 3,
+   "[MASK]": 4,
+   "choice": 5,
+   "score": 6,
+   "noul": 7,
+   "question": 8,
+   ":": 9,
+   "level": 10,
+   "false": 11,
+   "true": 12,
+   "no": 13,
+   "yes": 14,
+   "the": 15,
+   "statement": 16,
+   "holds": 17,
+   "does": 18,
+   "not": 19,
+   "hold": 20,
+   "refund": 21,
+   "approve": 22,
+   "deny": 23,
+   "escalate": 24,
+   "customer": 25,
+   "wants": 26,
+   "a": 27,
+   "panic": 28,
+   "body": 29,
+   "low": 30,
+   "high": 31,
+   "{": 32,
+   "}": 33,
+   "\"": 34,
+   ",": 35
+  },
+  "unk_token": "[UNK]"
+ }
+}
