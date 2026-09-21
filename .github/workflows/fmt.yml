@@ -1,0 +1,24 @@
+name: fmt
+
+on:
+  push:
+    branches: [main]
+    paths: ['**.rs', 'rustfmt.toml', '.github/workflows/fmt.yml']
+  pull_request:
+    paths: ['**.rs', 'rustfmt.toml', '.github/workflows/fmt.yml']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt }
+      - run: cargo fmt --all --check

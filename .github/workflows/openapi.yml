@@ -1,0 +1,22 @@
+name: openapi
+
+on:
+  push:
+    branches: [main]
+    paths: ['openapi.yaml', '.github/workflows/openapi.yml']
+  pull_request:
+    paths: ['openapi.yaml', '.github/workflows/openapi.yml']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: npx --yes @redocly/cli@2.53.3 lint openapi.yaml

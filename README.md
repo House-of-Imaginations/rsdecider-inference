@@ -3,6 +3,10 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/House-of-Imaginations/rsdecider-inference/actions/workflows/test.yml"><img src="https://github.com/House-of-Imaginations/rsdecider-inference/actions/workflows/test.yml/badge.svg" alt="test"></a> <a href="https://github.com/House-of-Imaginations/rsdecider-inference/actions/workflows/clippy.yml"><img src="https://github.com/House-of-Imaginations/rsdecider-inference/actions/workflows/clippy.yml/badge.svg" alt="clippy"></a> <a href="https://github.com/House-of-Imaginations/rsdecider-inference/actions/workflows/fmt.yml"><img src="https://github.com/House-of-Imaginations/rsdecider-inference/actions/workflows/fmt.yml/badge.svg" alt="fmt"></a> <a href="https://github.com/House-of-Imaginations/rsdecider-inference/actions/workflows/redis.yml"><img src="https://github.com/House-of-Imaginations/rsdecider-inference/actions/workflows/redis.yml/badge.svg" alt="redis"></a> <a href="https://github.com/House-of-Imaginations/rsdecider-inference/actions/workflows/docker.yml"><img src="https://github.com/House-of-Imaginations/rsdecider-inference/actions/workflows/docker.yml/badge.svg" alt="docker"></a> <a href="https://github.com/House-of-Imaginations/rsdecider-inference/actions/workflows/openapi.yml"><img src="https://github.com/House-of-Imaginations/rsdecider-inference/actions/workflows/openapi.yml/badge.svg" alt="openapi"></a>
+</p>
+
+<p align="center">
   <a href="#quick-start">Quick start</a> ·
   <a href="#endpoints">Endpoints</a> ·
   <a href="#configure-rsdecidertoml">Configuration</a> ·
