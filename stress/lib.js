@@ -23,6 +23,11 @@ export function state(i) {
   }
 }
 
+// Unique ~90k-char state (under the default max_state_chars of 100k).
+export function bigState(i) {
+  return `Ticket ${i}: ` + 'customer was charged twice for their order and asks for a refund. '.repeat(1350);
+}
+
 // Zipf-ish over n states: small ids dominate, so ~70% of requests repeat a hot state.
 export function zipf(n) {
   return Math.min(n - 1, Math.floor(Math.pow(Math.random(), 3) * n));

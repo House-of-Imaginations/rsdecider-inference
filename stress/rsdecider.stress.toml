@@ -43,6 +43,15 @@ l1_ttl_secs = 3600
 l2_ttl_secs = 86400
 idempotency_ttl_secs = 86400
 
+# Explicit so stress runs don't shift if the defaults change. tokenize_queue = Σ max_pending (48 + 64);
+# the "tokenize" scenario fills it with large states and expects only 200/529.
+[knobs]
+tokenize_queue = 112
+overloaded_retry_after_secs = 1
+redis_timeout_ms = 250
+idempotency_local_max_bytes = 67108864
+idempotency_max_stored_bytes = 262144
+
 [[keys]]
 name = "stress"
 sha256 = "6a3c65679a6c247316cbd7301e5677b16f96838401263c2c35727dfe989ffb8d"

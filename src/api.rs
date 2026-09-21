@@ -361,11 +361,10 @@ async fn decide_items(
         let model = st.models[routes[i].0].clone();
         let (seg, preps) = (seg.clone(), missing.iter().map(|q| q.prep.clone()).collect::<Vec<_>>());
         // bounded wait: shed instead of holding the parsed request until its deadline
-        let queued = st
-            .tokenize_queue
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ApiError::Overloaded(st.cfg.knobs.retry_after()))?;
+        let queued = st.tokenize_queue.clone().try_acquire_owned().map_err(|_| {
+            metrics::counter!("rsdecider_tokenize_shed_total").increment(1);
+            ApiError::Overloaded(st.cfg.knobs.retry_after())
+        })?;
         let permit = tokio::time::timeout_at(deadline, st.tokenize.clone().acquire_owned())
             .await
             .map_err(|_| ApiError::Deadline)?
