@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="320" viewBox="0 0 1200 320" role="img" aria-labelledby="title desc">
+  <title id="title">rsdecider stress results</title>
+  <desc id="desc">Measured with k6 against the real Laya models on an Apple M1 Pro: cache hits at 2000 requests per second with p99 1.4 ms; cold requests p99 575 ms at capacity; zero 5xx or timeouts at about 30 times capacity, where excess load is shed with 529.</desc>
+
+  <rect width="1200" height="320" rx="24" fill="#0B0D10"/>
+  <text x="64" y="72" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" letter-spacing="3" fill="#8A8F98">STRESS · REAL LAYA MODELS · K6</text>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+    <g id="cached" transform="translate(64 0)">
+      <text y="164" font-size="72" font-weight="700" letter-spacing="-1" fill="#F2EFE8">1.4<tspan dx="10" font-size="36" fill="#8A8F98">ms</tspan></text>
+      <text y="206" font-size="24" fill="#D9D5CC">p99 on a cache hit</text>
+      <text y="240" font-size="20" fill="#8A8F98">2,000 req/s · 0 errors</text>
+    </g>
+    <path d="M420 112 V244" stroke="#262B33" stroke-width="2"/>
+    <g id="cold" transform="translate(456 0)">
+      <text y="164" font-size="72" font-weight="700" letter-spacing="-1" fill="#F2EFE8">575<tspan dx="10" font-size="36" fill="#8A8F98">ms</tspan></text>
+      <text y="206" font-size="24" fill="#D9D5CC">p99 cold, at capacity</text>
+      <text y="240" font-size="20" fill="#8A8F98">3 req/s × 3 questions · 0 errors</text>
+    </g>
+    <path d="M820 112 V244" stroke="#262B33" stroke-width="2"/>
+    <g id="overload" transform="translate(856 0)">
+      <text y="164" font-size="72" font-weight="700" fill="#F5A524">0</text>
+      <text y="206" font-size="24" fill="#D9D5CC">5xx or timeouts at ~30×</text>
+      <text y="240" font-size="20" fill="#8A8F98">excess shed as 529 + Retry-After</text>
+    </g>
+  </g>
+
+  <text x="64" y="286" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" fill="#6B7079">Apple M1 Pro · fp32 ONNX on CPU · stress/results/2026-09-21-m1pro.md</text>
+</svg>

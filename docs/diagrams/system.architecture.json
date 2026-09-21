@@ -1,0 +1,541 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "rsdecider System Architecture",
+    "locale": "en",
+    "quality_profile": "standard",
+    "repository": {
+      "url": "https://github.com/House-of-Imaginations/rsdecider-inference",
+      "provider": "github",
+      "revision": "efa2502f756f767cf1bb911494af3870e7a6fc31"
+    },
+    "viewBox": [
+      1820,
+      900
+    ]
+  },
+  "components": [
+    {
+      "id": "client",
+      "type": "external",
+      "label": "Client",
+      "sublabel": "Bearer API key",
+      "pos": [
+        40,
+        190
+      ],
+      "size": [
+        150,
+        62
+      ]
+    },
+    {
+      "id": "http",
+      "type": "frontend",
+      "label": "axum HTTP :3000",
+      "sublabel": "/v1/decide(/batch) /healthz /readyz",
+      "pos": [
+        470,
+        190
+      ],
+      "size": [
+        190,
+        62
+      ],
+      "sources": [
+        {
+          "path": "src/api.rs",
+          "line": 154
+        }
+      ]
+    },
+    {
+      "id": "auth",
+      "type": "security",
+      "label": "Auth + body limit",
+      "sublabel": "SHA-256 keys, DefaultBodyLimit",
+      "pos": [
+        740,
+        190
+      ],
+      "size": [
+        180,
+        62
+      ],
+      "sources": [
+        {
+          "path": "src/auth.rs"
+        }
+      ]
+    },
+    {
+      "id": "ratelimit",
+      "type": "security",
+      "label": "Rate limiter",
+      "sublabel": "per-key governor",
+      "pos": [
+        1000,
+        190
+      ],
+      "size": [
+        160,
+        62
+      ],
+      "sources": [
+        {
+          "path": "src/auth.rs",
+          "line": 25
+        }
+      ]
+    },
+    {
+      "id": "idem",
+      "type": "backend",
+      "label": "Idempotency store",
+      "sublabel": "moka fallback 100k",
+      "pos": [
+        1000,
+        380
+      ],
+      "size": [
+        160,
+        62
+      ],
+      "sources": [
+        {
+          "path": "src/idempotency.rs"
+        }
+      ]
+    },
+    {
+      "id": "redis",
+      "type": "database",
+      "label": "Redis 7",
+      "sublabel": "allkeys-lru 512mb",
+      "pos": [
+        1620,
+        380
+      ],
+      "size": [
+        160,
+        62
+      ],
+      "sources": [
+        {
+          "path": "docker-compose.yml"
+        }
+      ]
+    },
+    {
+      "id": "route",
+      "type": "backend",
+      "label": "Validate + Laya routing",
+      "sublabel": "lang::is_english / explicit",
+      "pos": [
+        740,
+        380
+      ],
+      "size": [
+        180,
+        62
+      ],
+      "sources": [
+        {
+          "path": "src/lang.rs"
+        },
+        {
+          "path": "src/api.rs",
+          "line": 274
+        }
+      ]
+    },
+    {
+      "id": "cache",
+      "type": "database",
+      "label": "Answer cache",
+      "sublabel": "L1 moka + L2 Redis",
+      "pos": [
+        470,
+        380
+      ],
+      "size": [
+        190,
+        62
+      ],
+      "sources": [
+        {
+          "path": "src/cache.rs"
+        }
+      ]
+    },
+    {
+      "id": "tokenize",
+      "type": "backend",
+      "label": "Tokenizer pool",
+      "sublabel": "HF tokenizers, spawn_blocking",
+      "pos": [
+        470,
+        560
+      ],
+      "size": [
+        190,
+        62
+      ],
+      "sources": [
+        {
+          "path": "src/api.rs",
+          "line": 350
+        }
+      ]
+    },
+    {
+      "id": "sched",
+      "type": "messagebus",
+      "label": "Scheduler",
+      "sublabel": "coalesce, admit, EMA shed",
+      "pos": [
+        740,
+        560
+      ],
+      "size": [
+        180,
+        62
+      ],
+      "sources": [
+        {
+          "path": "src/scheduler.rs",
+          "line": 177
+        }
+      ]
+    },
+    {
+      "id": "batcher",
+      "type": "messagebus",
+      "label": "Micro-batcher",
+      "sublabel": "max items/tokens, max_wait",
+      "pos": [
+        1000,
+        560
+      ],
+      "size": [
+        170,
+        62
+      ],
+      "sources": [
+        {
+          "path": "src/scheduler.rs",
+          "line": 294
+        }
+      ]
+    },
+    {
+      "id": "workers",
+      "type": "backend",
+      "label": "ORT worker threads",
+      "sublabel": "catch_unwind, intra-op",
+      "pos": [
+        1290,
+        560
+      ],
+      "size": [
+        180,
+        62
+      ],
+      "sources": [
+        {
+          "path": "src/scheduler.rs",
+          "line": 351
+        },
+        {
+          "path": "src/model/session.rs"
+        }
+      ]
+    },
+    {
+      "id": "english",
+      "type": "cloud",
+      "label": "english session",
+      "sublabel": "models/english/",
+      "pos": [
+        1160,
+        760
+      ],
+      "size": [
+        160,
+        62
+      ],
+      "sources": [
+        {
+          "path": "src/model/mod.rs",
+          "line": 38
+        }
+      ]
+    },
+    {
+      "id": "multi",
+      "type": "cloud",
+      "label": "multilingual session",
+      "sublabel": "models/multilingual/",
+      "pos": [
+        1380,
+        760
+      ],
+      "size": [
+        160,
+        62
+      ]
+    },
+    {
+      "id": "post",
+      "type": "backend",
+      "label": "Postprocess",
+      "sublabel": "choice / noul / score",
+      "pos": [
+        240,
+        560
+      ],
+      "size": [
+        150,
+        62
+      ],
+      "sources": [
+        {
+          "path": "src/model/postprocess.rs"
+        }
+      ]
+    },
+    {
+      "id": "metrics",
+      "type": "external",
+      "label": "Prometheus :9000",
+      "sublabel": "/metrics + 5s upkeep",
+      "pos": [
+        470,
+        50
+      ],
+      "size": [
+        170,
+        62
+      ],
+      "sources": [
+        {
+          "path": "src/metrics.rs"
+        },
+        {
+          "path": "src/main.rs",
+          "line": 63
+        }
+      ]
+    },
+    {
+      "id": "sighup",
+      "type": "security",
+      "label": "SIGHUP key reload",
+      "sublabel": "re-reads [[keys]]",
+      "pos": [
+        740,
+        50
+      ],
+      "size": [
+        180,
+        62
+      ],
+      "sources": [
+        {
+          "path": "src/main.rs",
+          "line": 91
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "rsdecider process (tokio runtime)",
+      "wraps": [
+        "http",
+        "auth",
+        "ratelimit",
+        "idem",
+        "route",
+        "cache",
+        "tokenize",
+        "sched",
+        "batcher",
+        "workers",
+        "english",
+        "multi",
+        "post",
+        "metrics",
+        "sighup"
+      ],
+      "pad": 24
+    },
+    {
+      "kind": "security-group",
+      "label": "per-model pipeline (english, multilingual)",
+      "wraps": [
+        "batcher",
+        "workers",
+        "english",
+        "multi"
+      ],
+      "pad": 14
+    }
+  ],
+  "connections": [
+    {
+      "from": "client",
+      "to": "http",
+      "label": "HTTPS JSON",
+      "variant": "emphasis"
+    },
+    {
+      "from": "http",
+      "to": "auth",
+      "label": "401 / 413",
+      "variant": "emphasis"
+    },
+    {
+      "from": "auth",
+      "to": "ratelimit",
+      "label": "429 Retry-After",
+      "variant": "emphasis"
+    },
+    {
+      "from": "ratelimit",
+      "to": "idem",
+      "label": "409 / replay / 422",
+      "variant": "emphasis",
+      "labelAt": [
+        1080,
+        340
+      ]
+    },
+    {
+      "from": "idem",
+      "to": "redis",
+      "label": "SET NX rsd:idem:",
+      "variant": "dashed"
+    },
+    {
+      "from": "idem",
+      "to": "route",
+      "label": "422 invalid",
+      "variant": "emphasis"
+    },
+    {
+      "from": "route",
+      "to": "cache",
+      "label": "lookup",
+      "variant": "emphasis"
+    },
+    {
+      "from": "cache",
+      "to": "redis",
+      "label": "L2 get / put",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "top",
+      "via": [
+        [
+          565,
+          300
+        ],
+        [
+          1700,
+          300
+        ]
+      ]
+    },
+    {
+      "from": "cache",
+      "to": "tokenize",
+      "label": "misses",
+      "variant": "emphasis",
+      "labelAt": [
+        565,
+        522
+      ]
+    },
+    {
+      "from": "tokenize",
+      "to": "sched",
+      "label": "jobs",
+      "variant": "emphasis"
+    },
+    {
+      "from": "sched",
+      "to": "batcher",
+      "label": "529 / 504",
+      "variant": "emphasis"
+    },
+    {
+      "from": "batcher",
+      "to": "workers",
+      "label": "batch",
+      "variant": "emphasis"
+    },
+    {
+      "from": "workers",
+      "to": "english",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "workers",
+      "to": "multi",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "workers",
+      "to": "post",
+      "label": "raw via shared future",
+      "fromSide": "top",
+      "toSide": "right",
+      "via": [
+        [
+          1380,
+          480
+        ],
+        [
+          430,
+          480
+        ],
+        [
+          430,
+          591
+        ]
+      ]
+    },
+    {
+      "from": "post",
+      "to": "client",
+      "label": "200 answers",
+      "fromSide": "left",
+      "toSide": "bottom"
+    },
+    {
+      "from": "http",
+      "to": "metrics",
+      "label": "counters",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "from": "sighup",
+      "to": "auth",
+      "label": "reload",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        830,
+        151
+      ]
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "POST /v1/decide Request Flow",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "legend": { "entries": { "frontend": { "label": "Response" }, "backend": { "label": "Handler step" }, "security": { "label": "Guard / error" }, "messagebus": { "label": "Scheduler" }, "database": { "label": "Cache" }, "cloud": { "label": "ORT inference" }, "external": { "label": "Client / replay" } } }
+  },
+  "lanes": [
+    { "id": "edge", "label": "HTTP handler · axum" },
+    { "id": "rejects", "label": "Early rejections", "variant": "exception" },
+    { "id": "engine", "label": "Scheduler · ORT workers" },
+    { "id": "failures", "label": "Runtime failures", "variant": "exception" }
+  ],
+  "nodes": [
+    { "id": "client", "lane": "edge", "col": 0, "type": "external", "label": "Client", "sublabel": "/v1/decide (+ /batch)", "width": 140 },
+    { "id": "gates", "lane": "edge", "col": 1, "type": "security", "label": "Edge gates", "sublabel": "auth · body · JSON · rate", "width": 140 },
+    { "id": "idem", "lane": "edge", "col": 2, "type": "security", "label": "Idempotency-Key", "sublabel": "Redis SET NX", "width": 152 },
+    { "id": "route", "lane": "edge", "col": 3, "type": "backend", "label": "Validate + route", "sublabel": "english | multilingual", "width": 140 },
+    { "id": "cache", "lane": "edge", "col": 4, "type": "database", "label": "Cache lookup", "sublabel": "L1 moka → L2 Redis", "width": 136 },
+    { "id": "tokenize", "lane": "edge", "col": 5, "type": "backend", "label": "Tokenize misses", "sublabel": "blocking pool", "width": 148 },
+    { "id": "reject", "lane": "rejects", "col": 1, "type": "security", "label": "401 · 413 · 422 · 429", "sublabel": "Retry-After on 429", "width": 156 },
+    { "id": "idemExit", "lane": "rejects", "col": 2, "type": "external", "label": "Replay · 409 · 422", "sublabel": "stored 200 or conflict", "width": 152 },
+    { "id": "invalid", "lane": "rejects", "col": 3, "type": "security", "label": "422 invalid", "sublabel": "state · questions · model", "width": 140 },
+    { "id": "admit", "lane": "engine", "col": 5, "type": "messagebus", "label": "Coalesce + admit", "sublabel": "permits · EMA shed", "width": 152 },
+    { "id": "batcher", "lane": "engine", "col": 4, "type": "messagebus", "label": "Micro-batcher", "sublabel": "items · tokens · wait", "width": 136 },
+    { "id": "worker", "lane": "engine", "col": 3, "type": "cloud", "label": "ORT worker", "sublabel": "catch_unwind · L1 + async L2", "width": 148 },
+    { "id": "post", "lane": "engine", "col": 2, "type": "backend", "label": "Postprocess", "sublabel": "Laya answers", "width": 132 },
+    { "id": "respond", "lane": "engine", "col": 1, "type": "frontend", "label": "200 JSON", "sublabel": "store idem record", "width": 140 },
+    { "id": "e500", "lane": "failures", "col": 3, "type": "security", "label": "500 internal", "sublabel": "worker panic", "width": 140 },
+    { "id": "e504", "lane": "failures", "col": 4, "type": "security", "label": "504 deadline", "sublabel": "expiry at any await", "width": 136 },
+    { "id": "e529", "lane": "failures", "col": 5, "type": "security", "label": "529 overloaded", "sublabel": "Retry-After", "width": 132 }
+  ],
+  "edges": [
+    { "id": "m1", "from": "client", "to": "gates", "variant": "emphasis" },
+    { "id": "m2", "from": "gates", "to": "idem", "variant": "emphasis" },
+    { "id": "m3", "from": "idem", "to": "route", "label": "new", "variant": "emphasis" },
+    { "id": "m4", "from": "route", "to": "cache", "variant": "emphasis" },
+    { "id": "m5", "from": "cache", "to": "tokenize", "label": "misses", "variant": "emphasis" },
+    { "id": "m6", "from": "tokenize", "to": "admit", "variant": "emphasis" },
+    { "id": "m7", "from": "admit", "to": "batcher", "variant": "emphasis" },
+    { "id": "m8", "from": "batcher", "to": "worker", "variant": "emphasis" },
+    { "id": "m9", "from": "worker", "to": "post", "variant": "emphasis" },
+    { "id": "m10", "from": "post", "to": "respond", "variant": "emphasis" },
+    { "id": "x1", "from": "gates", "to": "reject", "variant": "security", "role": "error" },
+    { "id": "x2", "from": "idem", "to": "idemExit", "variant": "security", "role": "error" },
+    { "id": "x3", "from": "route", "to": "invalid", "variant": "security", "role": "error" },
+    { "id": "x4", "from": "admit", "to": "e529", "variant": "security", "role": "error" },
+    { "id": "x5", "from": "batcher", "to": "e504", "variant": "security", "role": "error" },
+    { "id": "x6", "from": "worker", "to": "e500", "variant": "security", "role": "error" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Order in code", "items": ["Rate limit charges one cell per item after JSON parse", "Cache lookup runs before tokenization; hits skip inference"] },
+    { "dot": "amber", "title": "Batch endpoint", "items": ["/v1/decide/batch runs the same pipeline for every item", "Identical in-flight keys coalesce onto one inference"] },
+    { "dot": "rose", "title": "Deadline", "items": ["One request deadline bounds tokenize, admission and wait", "Admission sheds early (529) instead of timing out late (504)"] }
+  ]
+}
