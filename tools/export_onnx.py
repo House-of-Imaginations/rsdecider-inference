@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from transformers import AutoModel
 
 import laya
-from laya.common import QTYPES, DecisionModel, build_sequence, render_options
+from laya.common import QTYPE_NAMES, QTYPES, DecisionModel, build_sequence, render_options
 from laya.lang import is_english
 
 
@@ -61,6 +61,12 @@ def eager_model(agent):
 def softmax(x):
     e = np.exp(x - np.max(x))
     return e / e.sum()
+
+
+def temperature(t_by_type, t_by_options, qtype, k):
+    """Mirror src/model/postprocess.rs answer(): the option-count bucket, else the type's temperature."""
+    size = "2" if k <= 2 else "3-5" if k <= 5 else "6-10" if k <= 10 else "11+"
+    return max(t_by_options.get(f"{QTYPE_NAMES[qtype]}:{size}", t_by_type[qtype]), 1e-3)
 
 
 def encode(agent, state, qdef):
@@ -123,12 +129,11 @@ def main():
                       "marker_pos": {0: "B", 1: "K"}, "marker_mask": {0: "B", 1: "K"},
                       "logits": {0: "B", 1: "K"}, "act_prob": {0: "B"}},
     )
-    if args.quantize == "int8":
+    check_path = onnx_path
+    if args.quantize == "int8":  # quantize beside the fp32; it replaces model.onnx only if the gate passes
         from onnxruntime.quantization import QuantType, quantize_dynamic
-        fp32 = onnx_path + ".fp32"
-        os.replace(onnx_path, fp32)
-        quantize_dynamic(fp32, onnx_path, weight_type=QuantType.QInt8)
-        os.remove(fp32)
+        check_path = os.path.join(args.out, "model.int8.onnx")
+        quantize_dynamic(onnx_path, check_path, weight_type=QuantType.QInt8)
 
     tok.backend_tokenizer.save(os.path.join(args.out, "tokenizer.json"))
     cfg = agent.cfg
@@ -143,10 +148,10 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     with open(os.path.join(here, "fixture_requests.json")) as f:
         requests = json.load(f) + generated_cases()
-    sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    sess = ort.InferenceSession(check_path, providers=["CPUExecutionProvider"])
     fixtures, worst = [], 0.0
     n_q = agree = 0
-    max_dp = 0.0
+    max_dp = max_dact = 0.0
     for req in requests:
         case = {"state": req["state"], "questions": req["questions"], "is_english": is_english(req["state"]),
                 "encoded": {}, "raw": {}, "errors": []}
@@ -171,19 +176,26 @@ def main():
                 k = len(enc["markers"])
                 ref = np.array(case["raw"][qid]["logits"])
                 worst = max(worst, float(np.abs(out_logits[i, :k] - ref).max()))
-                p_ort, p_ref = softmax(out_logits[i, :k]), softmax(ref)
+                t = temperature(agent.temperature, agent.temperature_by_options, enc["qtype"], k)
+                p_ort, p_ref = softmax(out_logits[i, :k] / t), softmax(ref / t)
                 n_q += 1
                 agree += int(np.argmax(p_ort) == np.argmax(p_ref))
                 max_dp = max(max_dp, float(np.abs(p_ort - p_ref).max()))
+                max_dact = max(max_dact, abs(float(out_act[i]) - case["raw"][qid]["act_prob"]))
         fixtures.append(case)
     with open(os.path.join(args.out, "fixtures.json"), "w") as f:
         json.dump(fixtures, f, ensure_ascii=False)
     print(f"wrote {len(fixtures)} fixtures; worst ORT-vs-PyTorch logit diff {worst:.2e}")
-    print(f"top-1 agreement {agree}/{n_q}; max |Δp| {max_dp:.4f}")
+    print(f"top-1 agreement {agree}/{n_q}; max |Δp| {max_dp:.4f} (temperature-scaled); max |Δ act_prob| {max_dact:.4f}")
     if args.quantize is None and worst > 1e-2:
         raise SystemExit("parity self-check failed: ORT output differs from PyTorch")
-    if args.quantize == "int8" and (agree < n_q or max_dp > 0.05):
-        raise SystemExit("int8 decision gate failed: top-1 must match on every question and |Δp| <= 0.05")
+    if args.quantize == "int8":
+        del sess  # release the file before moving or deleting it
+        if agree < n_q or max_dp > 0.05 or max_dact > 0.05:
+            os.remove(check_path)
+            raise SystemExit("int8 decision gate failed: top-1 must match on every question, |Δp| <= 0.05 and "
+                             "|Δ act_prob| <= 0.05; kept the fp32 model.onnx")
+        os.replace(check_path, onnx_path)
 
 
 if __name__ == "__main__":
