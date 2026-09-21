@@ -9,10 +9,12 @@ Writes <out>/model.onnx, tokenizer.json, laya.json, fixtures.json and self-check
 import argparse
 import json
 import os
+import types
 
 import numpy as np
 import onnxruntime as ort
 import torch
+import torch.nn.functional as F
 from transformers import AutoModel
 
 import laya
@@ -32,6 +34,18 @@ class Wrapper(torch.nn.Module):
         return logits, torch.softmax(act.float(), -1)[:, 0]
 
 
+def mha_forward(self, query, key, value, key_padding_mask=None, need_weights=False, attn_mask=None,
+                average_attn_weights=True, is_causal=False):
+    """Self-attention for the head layers. The TorchScript trace of nn.MultiheadAttention bakes the
+    trace-time sequence length into q/k.view(tgt_len, ...), so the exported graph fails on any other L.
+    key_padding_mask arrives as the additive float mask TransformerEncoderLayer builds."""
+    E, H = self.embed_dim, self.num_heads
+    qkv = F.linear(query, self.in_proj_weight, self.in_proj_bias).unflatten(-1, (3, H, E // H)).permute(2, 0, 3, 1, 4)
+    mask = None if key_padding_mask is None else key_padding_mask[:, None, None, :]
+    o = F.scaled_dot_product_attention(qkv[0], qkv[1], qkv[2], attn_mask=mask)
+    return self.out_proj(o.transpose(1, 2).flatten(2)), None
+
+
 def eager_model(agent):
     """Rebuild with eager attention (SDPA/flash paths do not export cleanly) and copy the weights."""
     enc = AutoModel.from_config(agent.model.encoder.config, attn_implementation="eager")
@@ -39,6 +53,8 @@ def eager_model(agent):
     head_layers = len(agent.model.head.layers) if agent.model.head is not None else 0
     m = DecisionModel(enc, head_layers, n_act)
     m.load_state_dict(agent.model.state_dict())
+    for layer in m.head.layers if m.head is not None else []:
+        layer.self_attn.forward = types.MethodType(mha_forward, layer.self_attn)
     return m.eval()
 
 
