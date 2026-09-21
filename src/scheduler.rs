@@ -340,18 +340,21 @@ async fn batcher(
     }
 }
 
-/// The oldest item, then the buffered items closest to its length, under the padded-token cap
-/// (ORT allocates batch × longest).
+/// The oldest item, then buffered items in arrival order, skipping any more than 2× off its length,
+/// under the padded-token cap (ORT allocates batch × longest). Arrival order keeps a request's
+/// questions together; sorting by closeness let newer same-type questions overtake them (late 504s).
 fn pick(first: WorkItem, buf: &mut VecDeque<WorkItem>, max_items: usize, max_tokens: usize) -> Vec<WorkItem> {
     let target = first.enc.ids.len();
-    let mut order: Vec<usize> = (0..buf.len()).collect();
-    order.sort_by_key(|&i| (buf[i].enc.ids.len().abs_diff(target), i));
     let (mut longest, mut chosen) = (target, Vec::new());
-    for i in order {
+    for (i, item) in buf.iter().enumerate() {
         if chosen.len() + 1 >= max_items {
             break;
         }
-        let len = longest.max(buf[i].enc.ids.len());
+        let n = item.enc.ids.len();
+        if n.max(target) > 2 * n.min(target) {
+            continue; // waits for a batch of its own length (it leads one once it is the oldest)
+        }
+        let len = longest.max(n);
         if (chosen.len() + 2) * len <= max_tokens {
             longest = len;
             chosen.push(i);
@@ -361,6 +364,7 @@ fn pick(first: WorkItem, buf: &mut VecDeque<WorkItem>, max_items: usize, max_tok
     chosen.sort_unstable_by(|a, b| b.cmp(a));
     let mut batch = vec![first];
     batch.extend(chosen.into_iter().map(|i| buf.remove(i).expect("index in range")));
+    batch[1..].reverse(); // back to arrival order
     batch
 }
 
@@ -633,18 +637,26 @@ mod tests {
     fn pick_groups_similar_lengths_oldest_first() {
         let mut buf: VecDeque<WorkItem> = [500, 12, 480, 11, 490].into_iter().map(item).collect();
         let batch = pick(item(10), &mut buf, 3, 8192);
-        assert_eq!(lens(&batch), [10, 11, 12], "the oldest leads, then the closest lengths");
+        assert_eq!(lens(&batch), [10, 12, 11], "the oldest leads, then similar lengths in arrival order");
         assert_eq!(lens(&buf), [500, 480, 490], "the rest stay buffered in arrival order");
         let batch = pick(buf.pop_front().unwrap(), &mut buf, 3, 8192);
-        assert_eq!(lens(&batch), [500, 490, 480]);
+        assert_eq!(lens(&batch), [500, 480, 490]);
+    }
+
+    #[test]
+    fn pick_keeps_arrival_order_within_2x() {
+        // 14 is within 2× of 10, so it goes before the newer, closer 10s (a request's siblings stay together).
+        let mut buf: VecDeque<WorkItem> = [14, 10, 10].into_iter().map(item).collect();
+        assert_eq!(lens(&pick(item(10), &mut buf, 2, 8192)), [10, 14]);
+        assert_eq!(lens(&buf), [10, 10]);
     }
 
     #[test]
     fn pick_respects_the_padded_token_cap() {
         let mut buf: VecDeque<WorkItem> = [12, 11].into_iter().map(item).collect();
-        // 10 + 11 pad to 2 × 11 = 22 <= 30; adding 12 would pad to 3 × 12 = 36.
-        assert_eq!(lens(&pick(item(10), &mut buf, 8, 30)), [10, 11]);
-        assert_eq!(lens(&buf), [12]);
+        // 10 + 12 pad to 2 × 12 = 24 <= 30; adding 11 would pad to 3 × 12 = 36.
+        assert_eq!(lens(&pick(item(10), &mut buf, 8, 30)), [10, 12]);
+        assert_eq!(lens(&buf), [11]);
     }
 
     #[test]
