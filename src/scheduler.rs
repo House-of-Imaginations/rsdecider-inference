@@ -271,6 +271,8 @@ impl Scheduler {
                 let dl = Arc::new(Mutex::new(deadline));
                 let weak = shared.downgrade().expect("fresh future is pending");
                 map.insert(job.key, Entry { generation, weak, deadline: dl.clone() });
+                // Counted inside the lock so the next admit sees it; this job's WorkItem subtracts it on drop.
+                self.models[job.model].queued_tokens.fetch_add(job.enc.ids.len(), Ordering::Relaxed);
                 let permit = permits[job.model].as_mut().unwrap().split(1).unwrap();
                 parts.push((job.clone(), generation, tx, dl, permit));
                 subs.push((job.key, shared));
@@ -280,7 +282,6 @@ impl Scheduler {
         for (job, generation, tx, deadline, permit) in parts {
             let q = &self.models[job.model];
             let tokens = job.enc.ids.len();
-            q.queued_tokens.fetch_add(tokens, Ordering::Relaxed);
             let item = WorkItem {
                 key: job.key,
                 generation,
@@ -322,7 +323,8 @@ async fn batcher(
             }
         }
         let close = Instant::now() + max_wait;
-        while buf.len() < max_items {
+        // Stop early once the buffer can already fill a batch (real tokens >= cap implies padded >= cap).
+        while buf.len() < max_items && buf.iter().map(|i| i.enc.ids.len()).sum::<usize>() < max_tokens {
             let Ok(Some(item)) = tokio::time::timeout_at(close, rx.recv()).await else { break };
             buf.push_back(item);
         }
@@ -489,6 +491,17 @@ mod tests {
         Instant::now() + Duration::from_secs(n)
     }
 
+    /// Polls `cond` every millisecond, failing the test after 2 s.
+    async fn wait_until(cond: impl Fn() -> bool) {
+        for _ in 0..2000 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("condition not met within 2 s");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn identical_concurrent_jobs_run_once() {
         let fake = Fake { delay: Duration::from_millis(50), ..Fake::default() };
@@ -513,7 +526,7 @@ mod tests {
             let s = s.clone();
             tokio::spawn(async move { s.run_jobs(vec![job(9, 1, 4)], secs(5)).await })
         };
-        tokio::time::sleep(Duration::from_millis(20)).await; // model b: 1 of 2 permits used
+        wait_until(|| s.map.lock().unwrap().contains_key(&[9; 32])).await; // model b: 1 of 2 permits used
         let r = s.run_jobs(vec![job(1, 0, 4), job(2, 1, 4), job(3, 1, 4)], secs(5)).await;
         assert_eq!(r.unwrap_err(), SchedError::Overloaded);
         assert_eq!(s.models[0].permits.available_permits(), 4, "model a permits returned");
@@ -631,6 +644,18 @@ mod tests {
         assert_eq!(lens(&buf), [12]);
     }
 
+    #[test]
+    fn pick_with_one_item_cap_returns_only_the_first() {
+        let mut buf: VecDeque<WorkItem> = [11, 12].into_iter().map(item).collect();
+        assert_eq!(lens(&pick(item(10), &mut buf, 1, 8192)), [10]);
+        assert_eq!(lens(&buf), [11, 12]);
+    }
+
+    #[test]
+    fn pick_from_an_empty_buffer_returns_only_the_first() {
+        assert_eq!(lens(&pick(item(10), &mut VecDeque::new(), 8, 8192)), [10]);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn abandoned_items_are_skipped() {
         let fake = Fake { delay: Duration::from_millis(100), ..Fake::default() };
@@ -685,7 +710,7 @@ mod tests {
             let s = s.clone();
             tokio::spawn(async move { s.run_jobs((2..7).map(|n| job(n, 0, 4)).collect(), secs(5)).await })
         };
-        tokio::time::sleep(Duration::from_millis(20)).await; // 5 items queued: ~0.5 s of work
+        wait_until(|| s.map.lock().unwrap().contains_key(&[2; 32])).await; // 5 items queued: ~0.5 s of work
         let started = Instant::now();
         let r = s.run_jobs(vec![job(9, 0, 4)], Instant::now() + Duration::from_millis(300)).await;
         assert_eq!(r.unwrap_err(), SchedError::Overloaded);
@@ -702,7 +727,7 @@ mod tests {
             let s = s.clone();
             tokio::spawn(async move { s.run_jobs(vec![job(2, 0, 4)], secs(5)).await })
         };
-        tokio::time::sleep(Duration::from_millis(20)).await; // 1 item ahead: ~0.1 s
+        wait_until(|| s.map.lock().unwrap().contains_key(&[2; 32])).await; // 1 item ahead: ~0.1 s
         let started = Instant::now();
         // Ahead alone fits 300 ms; ahead plus these 5 items (~0.6 s) does not.
         let r = s.run_jobs((3..8).map(|n| job(n, 0, 4)).collect(), Instant::now() + Duration::from_millis(300)).await;
@@ -713,22 +738,21 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn queued_tokens_return_to_zero() {
-        let fake = Fake { delay: Duration::from_millis(100), ..Fake::default() };
+        let fake = Fake { delay: Duration::from_millis(400), ..Fake::default() };
         let s = sched(vec![spec("m", &fake, 64, 1, 8192)]).await;
-        s.run_jobs(vec![job(1, 0, 400)], secs(5)).await.unwrap(); // success; low estimate: 0.25 ms/token
+        s.run_jobs(vec![job(1, 0, 400)], secs(5)).await.unwrap(); // success; low estimate: 1 ms/token
         let busy = {
             let s = s.clone();
             tokio::spawn(async move { s.run_jobs(vec![job(2, 0, 4)], secs(5)).await })
         };
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_until(|| s.map.lock().unwrap().contains_key(&[2; 32])).await;
         let r = s.run_jobs(vec![job(3, 0, 4)], Instant::now() + Duration::from_millis(50)).await;
         assert_eq!(r.unwrap_err(), SchedError::Deadline, "admitted, then stuck behind the busy batch");
         let r = s.run_jobs((4..9).map(|n| job(n, 0, 400)).collect(), Instant::now() + Duration::from_millis(300)).await;
         assert_eq!(r.unwrap_err(), SchedError::Overloaded);
         busy.await.unwrap().unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await; // the dead item is dropped once the worker frees
-        assert_eq!(s.models[0].queued_tokens.load(Ordering::Relaxed), 0);
-        assert!(s.map.lock().unwrap().is_empty());
+        // The dead item is dropped once the worker frees.
+        wait_until(|| s.models[0].queued_tokens.load(Ordering::Relaxed) == 0 && s.map.lock().unwrap().is_empty()).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -96,6 +96,7 @@ pub fn tokenize_prefix(tok: &Tokenizer, text: &str, need: usize) -> Result<Vec<u
     // `encode` reports byte offsets into its input.
     let enc = tok.encode(&text[..cut], false).map_err(|e| e.to_string())?;
     let keep = enc.get_offsets().iter().take_while(|&&(_, end)| end + MARGIN <= cut).count();
+    // ponytail: dense text over 8 bytes/token tokenizes twice (prefix, then full); retry a wider cut if it matters.
     if keep >= need { Ok(enc.get_ids()[..keep].to_vec()) } else { full() }
 }
 

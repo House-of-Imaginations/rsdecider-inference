@@ -267,7 +267,9 @@ first, then set the queues from the throughput you measure (the `rsdecider_*` me
 | `cache.l1_max_bytes` / `l1_ttl_secs` | In-process answer cache | repeats miss because entries were evicted | memory is tight |
 | `cache.redis_url` | Shared L2 cache and idempotency across instances | you run more than one instance | — |
 
-- **CPU budget:** `Σ(workers × intra_op_threads) + tokenize_threads + worker_threads ≈ vCPUs`. Giving the busier model
+- **CPU budget:** `Σ(workers × intra_op_threads) + tokenize_threads + worker_threads ≈ vCPUs`. With
+  `knobs.ort_global_threads = n`, the ORT term is `Σ workers + n − 1`: the pool has n − 1 threads and every running
+  batch's calling thread computes too. Giving the busier model
   more `intra_op_threads` usually beats adding `workers`. The 10-core M1 Pro stress config uses english `6`,
   multilingual `2`, tokenize `1`, HTTP `2` ([`stress/rsdecider.stress.toml`](./stress/rsdecider.stress.toml)).
 - **`max_pending ≈ items/s × 1–2 s`.** Latency is protected separately: admission estimates queue time from tokens, not
@@ -286,13 +288,14 @@ first, then set the queues from the throughput you measure (the `rsdecider_*` me
 | `knobs.redis_timeout_ms` | `250` | Redis is remote or slow (raise) or you'd rather miss fast (lower) |
 | `knobs.idempotency_local_max_bytes` | 64 MiB | no Redis and many `Idempotency-Key` clients |
 | `knobs.idempotency_max_stored_bytes` | 256 KiB | responses are large and must still replay |
-| `knobs.ort_global_threads` | per-session `intra_op_threads` | CPU is scarce — one shared ORT intra-op pool across every session instead of one pool per session |
+| `knobs.ort_global_threads` | per-session `intra_op_threads` | CPU is scarce — one shared ORT intra-op pool (n − 1 threads plus each running batch's caller) across every session instead of one pool per session |
 
 ### Small machines
 
 [`self-hosted/rsdecider.small.toml`](./self-hosted/rsdecider.small.toml) is a starting point for 2–4 vCPU / 4 GB
 boxes: 1 worker per model, 1 tokenize thread, 1 HTTP worker thread, `[knobs] ort_global_threads` set to cores − 1 (so
-2 on a 2–3 vCPU box, adjust up on 4), and smaller `max_batch_tokens` / `max_pending` so a burst can't blow the memory
+2 on a 2–3 vCPU box, adjust up on 4; the startup thread-budget warning counts both models' calling threads, so it
+fires when both could run at once), and smaller `max_batch_tokens` / `max_pending` so a burst can't blow the memory
 budget. Copy it, mount your models, and tune `ort_global_threads` to your core count.
 
 **RAM floor:** loading both fp32 models takes about 2.9 GB, so plan on 4 GB RAM minimum. With 2 GB, load only one

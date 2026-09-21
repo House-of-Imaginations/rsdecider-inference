@@ -45,7 +45,9 @@ fn main() -> Result<(), String> {
                     .with_intra_threads(n)
                     .and_then(|p| p.with_spin_control(false))
                     .map_err(|e| e.to_string())?;
-                ort::init().with_global_thread_pool(pool).commit();
+                if !ort::init().with_global_thread_pool(pool).commit() {
+                    return Err("ORT environment already initialised; ort_global_threads not applied".into());
+                }
             }
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(cfg.server.worker_threads)
@@ -81,7 +83,8 @@ async fn serve(cfg: Config, path: PathBuf, fake_delay_ms: Option<u64>) -> Result
     let threads = cfg.server.worker_threads
         + cfg.server.tokenize_threads
         + match cfg.knobs.ort_global_threads {
-            Some(n) => n,
+            // Each concurrent Run's calling thread computes alongside the pool's n - 1 threads.
+            Some(n) => n - 1 + cfg.models.iter().map(|m| m.workers).sum::<usize>(),
             None => cfg.models.iter().map(|m| m.workers * m.intra_op_threads).sum::<usize>(),
         };
     if threads > cores {

@@ -15,7 +15,9 @@ pub struct Knobs {
     pub idempotency_local_max_bytes: u64,
     /// Largest response stored for replay; larger ones re-run on repeat.
     pub idempotency_max_stored_bytes: usize,
-    /// One ORT intra-op thread pool of this size shared by every session; per-model intra_op_threads is then ignored.
+    /// One ORT intra-op pool shared by every session; per-model intra_op_threads is then ignored. Size n includes
+    /// the calling thread (n - 1 pool threads), and each concurrent Run also occupies its caller, so up to
+    /// Σ workers + n - 1 threads compute at once.
     pub ort_global_threads: Option<usize>,
 }
 

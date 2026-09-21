@@ -59,7 +59,7 @@ impl OrtBackend {
         global_pool: bool,
     ) -> Result<Self, String> {
         let ep = match execution_provider {
-            // ort's CPU EP runs without an arena by default, so memory is returned after every run.
+            // ort's CPU EP registers no arena by default; tensors are freed after every run.
             "cpu" => ort::ep::CPU::default().build(),
             #[cfg(feature = "cuda")]
             "cuda" => ort::ep::CUDA::default().with_device_id(0).build(),
@@ -68,7 +68,7 @@ impl OrtBackend {
         let build = || -> ort::Result<Session> {
             let b = Session::builder()?
                 .with_optimization_level(GraphOptimizationLevel::Level3)?
-                // Dynamic batch size: a fixed memory pattern would pin the arena to the first batch shape seen.
+                // Shapes vary per batch: ORT would plan and cache a memory pattern for every distinct input shape.
                 .with_memory_pattern(false)?;
             let b = if global_pool {
                 b
