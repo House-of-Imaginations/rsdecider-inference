@@ -7,6 +7,17 @@
 </p>
 
 <p align="center">
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-2024_edition-000000?style=flat-square&logo=rust&logoColor=white" alt="Rust 2024 edition"></a>
+  <a href="https://tokio.rs"><img src="https://img.shields.io/badge/tokio-1.53-463E3E?style=flat-square" alt="tokio 1.53"></a>
+  <a href="https://github.com/tokio-rs/axum"><img src="https://img.shields.io/badge/axum-0.8-463E3E?style=flat-square" alt="axum 0.8"></a>
+  <a href="https://onnxruntime.ai"><img src="https://img.shields.io/badge/ONNX_Runtime-ort_2.0-005CED?style=flat-square&logo=onnx&logoColor=white" alt="ONNX Runtime via ort 2.0"></a>
+  <a href="https://redis.io"><img src="https://img.shields.io/badge/Redis-optional_L2-DC382D?style=flat-square&logo=redis&logoColor=white" alt="Redis (optional L2 cache)"></a>
+  <a href="./openapi.yaml"><img src="https://img.shields.io/badge/OpenAPI-3.1-6BA539?style=flat-square&logo=openapiinitiative&logoColor=white" alt="OpenAPI 3.1"></a>
+  <a href="./self-hosted"><img src="https://img.shields.io/badge/Docker-self--hosted-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker self-hosted"></a>
+  <a href="https://github.com/NandhaKishorM/laya"><img src="https://img.shields.io/badge/model-Laya-F5A524?style=flat-square" alt="Laya model"></a>
+</p>
+
+<p align="center">
   <a href="#quick-start">Quick start</a> ·
   <a href="#endpoints">Endpoints</a> ·
   <a href="#configure-rsdecidertoml">Configuration</a> ·
@@ -77,6 +88,10 @@ The same request again returns in `0.1 ms` with `"cached": true`. A Vietnamese `
 
 ## Quick start
 
+> [!IMPORTANT]
+> You need Rust 1.85+ (edition 2024) and Python 3.10+ for the one-time model export. Docker is only needed for
+> `self-hosted/` and the Redis/e2e test suites; [k6](https://k6.io) only for `stress/`.
+
 **1. Export the models** (once; needs Python 3.10+). Writes `models/<name>/{model.onnx, tokenizer.json, laya.json}` and
 self-checks ONNX Runtime against PyTorch.
 
@@ -113,8 +128,12 @@ curl localhost:3000/readyz                                 # → ready
 | `GET` | `/openapi.yaml` | — | The OpenAPI 3.1 document, embedded in the binary. |
 | `GET` | `:9000/metrics` | — | Prometheus exposition (separate listener, `server.metrics_listen`). |
 
-Full schema: **[`openapi.yaml`](./openapi.yaml)** (OpenAPI 3.1), also served live at `http://localhost:3000/docs` (Swagger UI,
-loaded from jsDelivr) and `/openapi.yaml` for Postman or SDK generators.
+Full schema: **[`openapi.yaml`](./openapi.yaml)** (OpenAPI 3.1), also served live at `http://localhost:3000/docs` and
+`/openapi.yaml` for Postman or SDK generators.
+
+> [!NOTE]
+> `/docs` loads Swagger UI from jsDelivr, so it needs internet access in the browser. The API itself has no external
+> dependencies.
 
 <details>
 <summary><b>Question types</b></summary>
@@ -243,8 +262,10 @@ curl localhost:3000/readyz
 ```
 
 Compose mounts `../models` read-only at `/models` and `self-hosted/rsdecider.toml` at `/etc/rsdecider/rsdecider.toml`;
-edit that file (keys, threads, `max_pending`) and restart. Metrics are published on `127.0.0.1:9000` only. The file
-ships with demo keys `dev-key` and `stress-key` — **replace them before exposing the port.**
+edit that file (keys, threads, `max_pending`) and restart. Metrics are published on `127.0.0.1:9000` only.
+
+> [!WARNING]
+> `self-hosted/rsdecider.toml` ships with the demo keys `dev-key` and `stress-key`. Replace them before exposing the port.
 
 ## How it works
 
@@ -264,6 +285,7 @@ Runtime workers. Answers are post-processed into Laya's format, written to L1 an
   <img src="./assets/readme/request-flow-light.png" width="100%" alt="Request flow for POST /v1/decide: edge gates, idempotency, validate and route, cache lookup, tokenize misses, coalesce and admit, micro-batcher, ORT worker, postprocess, 200 JSON — with 4xx, 409, 500, 504 and 529 exits.">
 </picture>
 
+> [!TIP]
 > Interactive versions (pan, zoom, search, trace a path, export): [`docs/diagrams/system.html`](./docs/diagrams/system.html)
 > and [`docs/diagrams/request-flow.html`](./docs/diagrams/request-flow.html) — open locally in a browser. Sources are the
 > neighbouring `*.json` files ([archify](https://github.com/tt-a1i/archify) specs).
@@ -322,4 +344,4 @@ openapi.yaml       HTTP API
 
 - Batches are admitted all-or-nothing, so under contention large `/v1/decide/batch` calls lose to single requests.
 - The admission estimate (EMA) adapts upward quickly but has no explicit decay after a slow spell.
-- The Redis and Docker paths are covered by tests that need Docker; they were compile-checked, not run, for this release.
+- The Redis suite runs in CI (testcontainers); the Docker e2e suite needs exported models, so it runs locally only.
