@@ -1,4 +1,4 @@
-//! Black-box HTTP suite against a running server (docker compose up).
+//! Black-box HTTP suite against a running server (cd self-hosted && docker compose up).
 //! Run: RSD_URL=http://127.0.0.1:3000 RSD_KEY=dev-key cargo test --features e2e --test e2e
 #![cfg(feature = "e2e")]
 
