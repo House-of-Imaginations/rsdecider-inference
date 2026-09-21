@@ -14,3 +14,20 @@ services:
     volumes:
       - ../models:/models:ro
       - ./rsdecider.toml:/etc/rsdecider/rsdecider.toml:ro
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    depends_on: [rsdecider]
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  grafana:
+    image: grafana/grafana:11.3.1
+    depends_on: [prometheus]
+    restart: unless-stopped
+    ports: ["127.0.0.1:3001:3000"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro

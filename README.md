@@ -327,6 +327,14 @@ edit that file (keys, threads, `max_pending`) and restart. Metrics are published
 > [!WARNING]
 > `self-hosted/rsdecider.toml` ships with the demo keys `dev-key` and `stress-key`. Replace them before exposing the port.
 
+### Monitoring
+
+`docker compose up` also starts Prometheus (scraping `:9000/metrics` every 5s, no exposed port) and Grafana at
+[http://127.0.0.1:3001](http://127.0.0.1:3001) (`admin`/`admin`), pre-provisioned with a **rsdecider** dashboard:
+request rate and latency (p50/p95/p99), sheds, 504/5xx rate, queue depth, inference latency and batch size by model,
+cache hit ratio, coalescing, padding waste, tokens/s, and Redis/orphaned-inference errors. `/metrics` itself stays on
+`127.0.0.1:9000`, unchanged.
+
 ## How it works
 
 <picture>
