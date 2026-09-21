@@ -1,0 +1,11 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+  rsdecider:
+    build: .
+    depends_on: [redis]
+    ports: ["3000:3000", "9000:9000"]
+    volumes:
+      - ./models:/models:ro
+      - ./rsdecider.docker.toml:/etc/rsdecider/rsdecider.toml:ro

@@ -1,0 +1,6 @@
+target/
+models/
+.venv/
+docs/
+.omc/
+.claude/

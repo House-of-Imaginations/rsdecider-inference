@@ -1,0 +1,31 @@
+# Used by docker-compose. dev-key = "dev-key"; stress key = "stress-key".
+[server]
+listen = "0.0.0.0:3000"
+metrics_listen = "0.0.0.0:9000"
+
+[routing]
+english_model = "english"
+non_english_model = "multilingual"
+
+[[models]]
+name = "english"
+path = "/models/english"
+
+[[models]]
+name = "multilingual"
+path = "/models/multilingual"
+
+[cache]
+redis_url = "redis://redis:6379"
+
+[[keys]]
+name = "dev"
+sha256 = "7e9f8fd111802be56c379d597842e29b2cebd35ff2133d431a49fa556a18704e"
+rps = 50
+burst = 100
+
+[[keys]]
+name = "stress"
+sha256 = "6a3c65679a6c247316cbd7301e5677b16f96838401263c2c35727dfe989ffb8d"
+rps = 100000
+burst = 100000
