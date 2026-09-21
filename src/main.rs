@@ -57,11 +57,9 @@ fn main() -> Result<(), String> {
     }
 }
 
-fn ort_factory(m: &ModelCfg, _lm: &LoadedModel, arena_shrink: bool, global_pool: bool) -> BackendFactory {
+fn ort_factory(m: &ModelCfg, _lm: &LoadedModel, global_pool: bool) -> BackendFactory {
     let (path, ep, intra) = (m.path.join("model.onnx"), m.execution_provider.clone(), m.intra_op_threads);
-    Arc::new(move || {
-        OrtBackend::new(&path, &ep, intra, arena_shrink, global_pool).map(|b| Box::new(b) as Box<dyn Backend>)
-    })
+    Arc::new(move || OrtBackend::new(&path, &ep, intra, global_pool).map(|b| Box::new(b) as Box<dyn Backend>))
 }
 
 async fn serve(cfg: Config, path: PathBuf, fake_delay_ms: Option<u64>) -> Result<(), String> {
@@ -101,8 +99,8 @@ async fn serve(cfg: Config, path: PathBuf, fake_delay_ms: Option<u64>) -> Result
             api::build(cfg.clone(), &move |_, _| fake.factory()).await?
         }
         None => {
-            let (arena_shrink, global_pool) = (cfg.knobs.ort_arena_shrink, cfg.knobs.ort_global_threads.is_some());
-            api::build(cfg.clone(), &move |m, lm| ort_factory(m, lm, arena_shrink, global_pool)).await?
+            let global_pool = cfg.knobs.ort_global_threads.is_some();
+            api::build(cfg.clone(), &move |m, lm| ort_factory(m, lm, global_pool)).await?
         }
     };
 

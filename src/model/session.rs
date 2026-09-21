@@ -1,7 +1,7 @@
 //! ORT backend: one `Session` per worker thread (`Session::run` takes `&mut self`).
 use super::postprocess::Raw;
 use crate::scheduler::{Backend, Batch};
-use ort::session::{RunOptions, Session, builder::GraphOptimizationLevel};
+use ort::session::{Session, builder::GraphOptimizationLevel};
 use ort::value::Tensor;
 use std::path::Path;
 
@@ -49,7 +49,6 @@ pub fn pad(batch: &Batch) -> Padded {
 
 pub struct OrtBackend {
     session: Session,
-    run_opts: Option<RunOptions>,
 }
 
 impl OrtBackend {
@@ -57,12 +56,11 @@ impl OrtBackend {
         model_onnx: &Path,
         execution_provider: &str,
         intra_threads: usize,
-        arena_shrink: bool,
         global_pool: bool,
     ) -> Result<Self, String> {
         let ep = match execution_provider {
-            // ort's CPU EP defaults to no arena; the shrink RunOption needs one registered to shrink.
-            "cpu" => ort::ep::CPU::default().with_arena_allocator(arena_shrink).build(),
+            // ort's CPU EP runs without an arena by default, so memory is returned after every run.
+            "cpu" => ort::ep::CPU::default().build(),
             #[cfg(feature = "cuda")]
             "cuda" => ort::ep::CUDA::default().with_device_id(0).build(),
             other => return Err(format!("execution provider {other:?} is not available in this build")),
@@ -82,14 +80,7 @@ impl OrtBackend {
             b.with_execution_providers([ep])?.commit_from_file(model_onnx)
         };
         let session = build().map_err(|e| format!("{}: {e}", model_onnx.display()))?;
-        let run_opts = if arena_shrink {
-            let mut o = RunOptions::new().map_err(|e| e.to_string())?;
-            o.set("memory.enable_memory_arena_shrinkage", "cpu:0").map_err(|e| e.to_string())?;
-            Some(o)
-        } else {
-            None
-        };
-        Ok(Self { session, run_opts })
+        Ok(Self { session })
     }
 }
 
@@ -104,11 +95,7 @@ impl Backend for OrtBackend {
             "marker_pos" => t(vec![p.b, p.k], p.marker_pos)?,
             "marker_mask" => t(vec![p.b, p.k], p.marker_mask)?,
         ];
-        let outs = match &self.run_opts {
-            Some(o) => self.session.run_with_options(inputs, o),
-            None => self.session.run(inputs),
-        }
-        .map_err(|e| e.to_string())?;
+        let outs = self.session.run(inputs).map_err(|e| e.to_string())?;
         let (_, logits) = outs["logits"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
         let (_, act) = outs["act_prob"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
         Ok(batch

@@ -246,13 +246,12 @@ burst = 40
     fn knobs_parse_and_validate() {
         let c = Config::from_toml_str(BASE).unwrap();
         assert_eq!((c.knobs.tokenize_queue, c.knobs.redis_timeout_ms), (None, 250));
-        assert_eq!((c.knobs.ort_arena_shrink, c.knobs.ort_global_threads), (false, None));
+        assert_eq!(c.knobs.ort_global_threads, None);
         let c =
             Config::from_toml_str(&format!("{BASE}\n[knobs]\ntokenize_queue = 64\nredis_timeout_ms = 100\n")).unwrap();
         assert_eq!((c.knobs.tokenize_queue, c.knobs.redis_timeout_ms), (Some(64), 100));
-        let c = Config::from_toml_str(&format!("{BASE}\n[knobs]\nort_arena_shrink = true\nort_global_threads = 4\n"))
-            .unwrap();
-        assert_eq!((c.knobs.ort_arena_shrink, c.knobs.ort_global_threads), (true, Some(4)));
+        let c = Config::from_toml_str(&format!("{BASE}\n[knobs]\nort_global_threads = 4\n")).unwrap();
+        assert_eq!(c.knobs.ort_global_threads, Some(4));
         let err = |k: &str| Config::from_toml_str(&format!("{BASE}\n[knobs]\n{k}\n")).unwrap_err();
         assert!(err("redis_timeout_ms = 0").contains("knobs.redis_timeout_ms"));
         assert!(err("idempotency_max_stored_bytes = 999999999999").contains("idempotency_local_max_bytes"));

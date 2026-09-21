@@ -61,7 +61,7 @@ fn onnx_matches_pytorch_fixtures() {
         }
     }
 
-    let mut backend = OrtBackend::new(&dir.join("model.onnx"), "cpu", 4, false, false).unwrap();
+    let mut backend = OrtBackend::new(&dir.join("model.onnx"), "cpu", 4, false).unwrap();
     let run = |b: &mut OrtBackend, its: &[&Item]| {
         b.run(&Batch { items: its.iter().map(|i| i.enc.clone()).collect(), pad_id: model.meta.pad_id }).unwrap()
     };

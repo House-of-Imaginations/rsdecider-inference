@@ -15,8 +15,6 @@ pub struct Knobs {
     pub idempotency_local_max_bytes: u64,
     /// Largest response stored for replay; larger ones re-run on repeat.
     pub idempotency_max_stored_bytes: usize,
-    /// Return ORT arena memory after every run (bounded RSS, some latency).
-    pub ort_arena_shrink: bool,
     /// One ORT intra-op thread pool of this size shared by every session; per-model intra_op_threads is then ignored.
     pub ort_global_threads: Option<usize>,
 }
@@ -29,7 +27,6 @@ impl Default for Knobs {
             redis_timeout_ms: 250,
             idempotency_local_max_bytes: 64 << 20,
             idempotency_max_stored_bytes: 256 << 10,
-            ort_arena_shrink: false,
             ort_global_threads: None,
         }
     }
