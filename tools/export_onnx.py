@@ -58,6 +58,11 @@ def eager_model(agent):
     return m.eval()
 
 
+def softmax(x):
+    e = np.exp(x - np.max(x))
+    return e / e.sum()
+
+
 def encode(agent, state, qdef):
     q = agent._to_internal(qdef)
     cfg = agent.cfg
@@ -140,6 +145,8 @@ def main():
         requests = json.load(f) + generated_cases()
     sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
     fixtures, worst = [], 0.0
+    n_q = agree = 0
+    max_dp = 0.0
     for req in requests:
         case = {"state": req["state"], "questions": req["questions"], "is_english": is_english(req["state"]),
                 "encoded": {}, "raw": {}, "errors": []}
@@ -162,13 +169,21 @@ def main():
             out_logits, out_act = sess.run(None, collate([e for _, e in items], tok.pad_token_id))
             for i, (qid, enc) in enumerate(items):
                 k = len(enc["markers"])
-                worst = max(worst, float(np.abs(out_logits[i, :k] - np.array(case["raw"][qid]["logits"])).max()))
+                ref = np.array(case["raw"][qid]["logits"])
+                worst = max(worst, float(np.abs(out_logits[i, :k] - ref).max()))
+                p_ort, p_ref = softmax(out_logits[i, :k]), softmax(ref)
+                n_q += 1
+                agree += int(np.argmax(p_ort) == np.argmax(p_ref))
+                max_dp = max(max_dp, float(np.abs(p_ort - p_ref).max()))
         fixtures.append(case)
     with open(os.path.join(args.out, "fixtures.json"), "w") as f:
         json.dump(fixtures, f, ensure_ascii=False)
     print(f"wrote {len(fixtures)} fixtures; worst ORT-vs-PyTorch logit diff {worst:.2e}")
+    print(f"top-1 agreement {agree}/{n_q}; max |Δp| {max_dp:.4f}")
     if args.quantize is None and worst > 1e-2:
         raise SystemExit("parity self-check failed: ORT output differs from PyTorch")
+    if args.quantize == "int8" and (agree < n_q or max_dp > 0.05):
+        raise SystemExit("int8 decision gate failed: top-1 must match on every question and |Δp| <= 0.05")
 
 
 if __name__ == "__main__":
