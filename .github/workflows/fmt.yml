@@ -1,10 +1,9 @@
 name: fmt
 
+# light check: every push on every branch (its result also shows on the PR)
 on:
   push:
-    branches: [main]
-    paths: ['**.rs', 'rustfmt.toml', '.github/workflows/fmt.yml']
-  pull_request:
+    branches: ['**']
     paths: ['**.rs', 'rustfmt.toml', '.github/workflows/fmt.yml']
 
 concurrency:

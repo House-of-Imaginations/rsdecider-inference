@@ -1,5 +1,6 @@
 name: docker
 
+# heavy check: pull requests and main only
 on:
   push:
     branches: [main]

@@ -1,10 +1,9 @@
 name: openapi
 
+# light check: every push on every branch (its result also shows on the PR)
 on:
   push:
-    branches: [main]
-    paths: ['openapi.yaml', '.github/workflows/openapi.yml']
-  pull_request:
+    branches: ['**']
     paths: ['openapi.yaml', '.github/workflows/openapi.yml']
 
 concurrency:
