@@ -1,9 +1,11 @@
 name: test
 
-# light check: every push on every branch (its result also shows on the PR)
+# light check: every push on any branch, and pull requests
 on:
   push:
     branches: ['**']
+    paths: ['src/**', 'tests/**', 'openapi.yaml', 'Cargo.toml', 'Cargo.lock', '.github/workflows/test.yml']
+  pull_request:
     paths: ['src/**', 'tests/**', 'openapi.yaml', 'Cargo.toml', 'Cargo.lock', '.github/workflows/test.yml']
 
 concurrency:
