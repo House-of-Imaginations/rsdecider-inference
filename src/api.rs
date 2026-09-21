@@ -242,7 +242,10 @@ async fn run(
     let guard = match ik {
         None => None,
         Some(ik) => {
-            let body_sha = hex::encode(<[u8; 32]>::from(Sha256::digest(&body)));
+            // the route is part of the digest: one body can parse on both endpoints
+            let route: &[u8] = if batch { b"batch\n" } else { b"decide\n" };
+            let body_sha =
+                hex::encode(<[u8; 32]>::from(Sha256::new().chain_update(route).chain_update(&body).finalize()));
             match st.idem.begin(&key.cfg.name, ik, &body_sha, id).await {
                 Begin::Proceed(g) => Some(g),
                 Begin::Replay(v) => return Ok(v),

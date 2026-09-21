@@ -185,6 +185,17 @@ async fn idempotency_replays_conflicts_and_rejects_mismatch() {
 }
 
 #[tokio::test]
+async fn idempotency_key_is_scoped_to_the_endpoint() {
+    let (app, _) = app(config(|_| {}), &Fake::default()).await;
+    // valid on both endpoints: serde ignores the fields each one does not use
+    let mut body = decide_body("x", "q");
+    body["items"] = json!([decide_body("y", "q")]);
+    let h = [auth(), ("idempotency-key", "both")];
+    assert_eq!(call(&app, "/v1/decide", body.clone(), &h).await.0, StatusCode::OK);
+    assert_eq!(call(&app, "/v1/decide/batch", body, &h).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
 async fn idempotency_never_replays_errors() {
     let fake = Fake { fail_with: Some("boom".into()), ..Fake::default() };
     let (app, _) = app(config(|_| {}), &fake).await;

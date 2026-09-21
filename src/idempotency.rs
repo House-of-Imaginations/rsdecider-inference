@@ -158,6 +158,7 @@ impl moka::Expiry<String, (Record, Instant)> for ExpiresAt {
 
 fn existing(rec: &Record, body_sha: &str, remaining: Duration) -> Begin {
     match rec {
+        Record::Pending { body_sha: b, .. } if b != body_sha => Begin::Mismatch,
         Record::Pending { .. } => Begin::InProgress(remaining),
         Record::Done { body_sha: b, response } if b == body_sha => Begin::Replay(response.clone()),
         Record::Done { .. } => Begin::Mismatch,
@@ -186,6 +187,10 @@ mod tests {
         let Begin::Proceed(g) = i.begin("acme", "k1", "sha-a", "req1").await else { panic!() };
         assert!(
             matches!(i.begin("acme", "k1", "sha-a", "req2").await, Begin::InProgress(d) if d > Duration::from_secs(10))
+        );
+        assert!(
+            matches!(i.begin("acme", "k1", "sha-b", "req2b").await, Begin::Mismatch),
+            "different body while pending"
         );
         i.finish(g, Some(&json!({"ok": 1}))).await;
         assert!(matches!(i.begin("acme", "k1", "sha-a", "req3").await, Begin::Replay(v) if v == json!({"ok": 1})));

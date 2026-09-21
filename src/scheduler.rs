@@ -307,7 +307,8 @@ async fn batcher(
                 None => return,
             },
         };
-        let mut tokens = first.enc.ids.len();
+        // ORT allocates batch × longest, so the cap applies to the padded size
+        let mut longest = first.enc.ids.len();
         let mut batch = vec![first];
         let close = Instant::now() + max_wait;
         while batch.len() < max_items {
@@ -315,11 +316,12 @@ async fn batcher(
             if !item.live(Instant::now()) {
                 continue; // dropped here: entry removed, permit released
             }
-            if tokens + item.enc.ids.len() > max_tokens {
+            let len = longest.max(item.enc.ids.len());
+            if (batch.len() + 1) * len > max_tokens {
                 carry = Some(item);
                 break;
             }
-            tokens += item.enc.ids.len();
+            longest = len;
             batch.push(item);
         }
         let now = Instant::now();
@@ -552,6 +554,15 @@ mod tests {
         let sizes = fake.batch_sizes.lock().unwrap().clone();
         assert_eq!(sizes.iter().sum::<usize>(), 10);
         assert!(sizes.iter().all(|&n| n <= 2), "8+8 fits 20 tokens, a third would not: {sizes:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn token_cap_counts_padding() {
+        let fake = Fake { delay: Duration::from_millis(30), ..Fake::default() };
+        let s = sched(vec![spec("m", &fake, 64, 8, 20)]).await;
+        // 16 + 2 = 18 raw tokens, but padded together they are 2 × 16 = 32 > 20
+        s.run_jobs(vec![job(1, 0, 16), job(2, 0, 2)], secs(5)).await.unwrap();
+        assert_eq!(*fake.batch_sizes.lock().unwrap(), [1, 1]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
