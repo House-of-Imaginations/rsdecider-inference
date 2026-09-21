@@ -1,0 +1,46 @@
+# Copy to rsdecider.toml. Size workers × intra_op_threads + tokenize_threads + worker_threads ≈ vCPUs.
+[server]
+listen = "0.0.0.0:3000"
+metrics_listen = "127.0.0.1:9000"
+worker_threads = 2        # tokio (HTTP) threads
+tokenize_threads = 2      # concurrent spawn_blocking tokenizations
+request_timeout_ms = 10000
+
+[limits]
+max_body_bytes = 1048576
+max_state_chars = 100000
+max_batch_states = 8
+max_questions_per_state = 16
+
+[routing]                 # Laya routing mode: English → english_model, else non_english_model
+english_model = "english"
+non_english_model = "multilingual"
+
+[[models]]
+name = "english"
+path = "models/english"   # model.onnx + tokenizer.json + laya.json (tools/export_onnx.py)
+execution_provider = "cpu" # or "cuda" (build with --features cuda)
+workers = 1               # ORT sessions, one per blocking thread
+intra_op_threads = 6
+max_pending = 256         # queue bound in questions; beyond this → 529
+max_batch_items = 8
+max_batch_tokens = 8192
+max_wait_ms = 2
+
+[[models]]
+name = "multilingual"
+path = "models/multilingual"
+
+[cache]
+l1_max_bytes = 268435456
+l1_ttl_secs = 3600
+# redis_url = "redis://127.0.0.1:6379"
+l2_ttl_secs = 86400
+idempotency_ttl_secs = 86400
+
+# Generate: rsdecider hash-key <secret>
+[[keys]]
+name = "dev"
+sha256 = "7e9f8fd111802be56c379d597842e29b2cebd35ff2133d431a49fa556a18704e" # "dev-key"
+rps = 50
+burst = 100

@@ -5,5 +5,6 @@ pub mod config;
 pub mod fake;
 pub mod idempotency;
 pub mod lang;
+pub mod metrics;
 pub mod model;
 pub mod scheduler;
