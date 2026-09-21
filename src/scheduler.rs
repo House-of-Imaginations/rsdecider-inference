@@ -74,8 +74,7 @@ pub struct WorkItem {
     deadline: Arc<Mutex<Instant>>,
     map: Map,
     _permit: OwnedSemaphorePermit,
-    /// `enc.ids.len()`, counted in `queued` until this item drops.
-    tokens: usize,
+    /// `enc.ids.len()` is counted in `queued` (by `admit`) until this item drops.
     queued: Arc<AtomicUsize>,
 }
 
@@ -92,7 +91,7 @@ impl WorkItem {
 
 impl Drop for WorkItem {
     fn drop(&mut self) {
-        self.queued.fetch_sub(self.tokens, Ordering::Relaxed);
+        self.queued.fetch_sub(self.enc.ids.len(), Ordering::Relaxed);
         let mut map = self.map.lock().unwrap();
         if map.get(&self.key).is_some_and(|e| e.generation == self.generation) {
             map.remove(&self.key);
@@ -281,7 +280,6 @@ impl Scheduler {
         // Lock released: build WorkItems and enqueue, with no await in between.
         for (job, generation, tx, deadline, permit) in parts {
             let q = &self.models[job.model];
-            let tokens = job.enc.ids.len();
             let item = WorkItem {
                 key: job.key,
                 generation,
@@ -290,7 +288,6 @@ impl Scheduler {
                 deadline,
                 map: self.map.clone(),
                 _permit: permit,
-                tokens,
                 queued: q.queued_tokens.clone(),
             };
             // A send error means the batcher is gone (shutdown, or every worker retired): fail
@@ -323,7 +320,8 @@ async fn batcher(
             }
         }
         let close = Instant::now() + max_wait;
-        // Stop early once the buffer can already fill a batch (real tokens >= cap implies padded >= cap).
+        // Stop early once real tokens already reach the cap (padded is only larger). The sum may
+        // include items that later `retain` drops as dead, which only stops collection sooner: harmless.
         while buf.len() < max_items && buf.iter().map(|i| i.enc.ids.len()).sum::<usize>() < max_tokens {
             let Ok(Some(item)) = tokio::time::timeout_at(close, rx.recv()).await else { break };
             buf.push_back(item);
@@ -403,7 +401,13 @@ fn worker(ctx: WorkerCtx, ready: std_mpsc::Sender<Result<(), String>>) {
         let mut panicked = false;
         let failure = match result {
             Ok(Ok(raws)) if raws.len() == items.len() => {
-                let x = batch_secs / items.iter().map(|i| i.enc.ids.len()).sum::<usize>().max(1) as f64;
+                let real_tokens = items.iter().map(|i| i.enc.ids.len()).sum::<usize>();
+                let longest = items.iter().map(|i| i.enc.ids.len()).max().unwrap_or(0);
+                metrics::counter!("rsdecider_real_tokens_total", "model" => ctx.name.clone())
+                    .increment(real_tokens as u64);
+                metrics::counter!("rsdecider_padded_tokens_total", "model" => ctx.name.clone())
+                    .increment((items.len() * longest) as u64);
+                let x = batch_secs / real_tokens.max(1) as f64;
                 let _ = ctx.secs_per_token.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
                     let old = f64::from_bits(b);
                     Some(if old == 0.0 { x } else { 0.8 * old + 0.2 * x }.to_bits())
@@ -617,7 +621,6 @@ mod tests {
             deadline: Arc::new(Mutex::new(Instant::now())),
             map: Arc::default(),
             _permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
-            tokens: 0,
             queued: Arc::default(),
         }
     }
@@ -791,7 +794,6 @@ mod tests {
             deadline: dl,
             map: map.clone(),
             _permit: permit,
-            tokens: 0,
             queued: Arc::default(),
         };
         drop(old);

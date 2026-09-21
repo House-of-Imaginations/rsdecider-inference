@@ -293,13 +293,16 @@ first, then set the queues from the throughput you measure (the `rsdecider_*` me
 ### Small machines
 
 [`self-hosted/rsdecider.small.toml`](./self-hosted/rsdecider.small.toml) is a starting point for 2–4 vCPU / 4 GB
-boxes: 1 worker per model, 1 tokenize thread, 1 HTTP worker thread, `[knobs] ort_global_threads` set to cores − 1 (so
-2 on a 2–3 vCPU box, adjust up on 4; the startup thread-budget warning counts both models' calling threads, so it
-fires when both could run at once), and smaller `max_batch_tokens` / `max_pending` so a burst can't blow the memory
-budget. Copy it, mount your models, and tune `ort_global_threads` to your core count.
+boxes: 1 worker per model, 1 tokenize thread, 1 HTTP worker thread, `[knobs] ort_global_threads = 2` for any box in
+that 2–4 vCPU range, and smaller `max_batch_tokens` / `max_pending` so a burst can't blow the memory budget. The
+startup thread-budget warning is expected on this profile: it counts the worst case, both models running at once
+plus the mostly idle HTTP and tokenize threads, so it fires even though the machine isn't actually oversubscribed
+in normal operation. Copy it and mount your models.
 
-**RAM floor:** loading both fp32 models takes about 2.9 GB, so plan on 4 GB RAM minimum. With 2 GB, load only one
-model (drop the `[[models]]` table you don't need and point `[routing]` at the one you keep).
+**RAM floor:** loading both fp32 models takes about 2.9 GB, and that's without Redis (512 MB in
+`self-hosted/docker-compose.yml`) or the 256 MiB in-process L1 cache — count those in if you run them on the same
+host, and plan closer to 4 GB just for the models. With 2 GB, load only one model (drop the `[[models]]` table you
+don't need and point `[routing]` at the one you keep).
 
 **int8:** `tools/export_onnx.py --quantize int8` exists and now refuses to write a model whose decisions differ from
 the fp32 one. Today's models fail that check — dynamic int8 gets top-1 agreement of 12/18 (English) and 14/19

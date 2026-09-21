@@ -1,5 +1,7 @@
 # 2-4 vCPU / 4 GB minimum (fp32 models; see README > Small machines for the RAM floor and why int8 isn't used).
-# Same mount layout as self-hosted/rsdecider.toml. Set ort_global_threads to cores - 1 on a 4 vCPU box.
+# Same mount layout as self-hosted/rsdecider.toml. ort_global_threads = 2 works for 2-4 vCPU boxes; the startup
+# thread-budget warning is expected on this profile (it counts the worst case: both models running at once, plus
+# the mostly idle HTTP and tokenize threads).
 [server]
 listen = "0.0.0.0:3000"
 metrics_listen = "0.0.0.0:9000"

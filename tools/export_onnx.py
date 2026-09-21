@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from transformers import AutoModel
 
 import laya
-from laya.common import QTYPE_NAMES, QTYPES, DecisionModel, build_sequence, render_options
+from laya.common import QTYPES, DecisionModel, build_sequence, render_options, temp_bucket
 from laya.lang import is_english
 
 
@@ -65,8 +65,7 @@ def softmax(x):
 
 def temperature(t_by_type, t_by_options, qtype, k):
     """Mirror src/model/postprocess.rs answer(): the option-count bucket, else the type's temperature."""
-    size = "2" if k <= 2 else "3-5" if k <= 5 else "6-10" if k <= 10 else "11+"
-    return max(t_by_options.get(f"{QTYPE_NAMES[qtype]}:{size}", t_by_type[qtype]), 1e-3)
+    return max(t_by_options.get(temp_bucket(qtype, k), t_by_type[qtype]), 1e-3)
 
 
 def encode(agent, state, qdef):
@@ -135,67 +134,74 @@ def main():
         check_path = os.path.join(args.out, "model.int8.onnx")
         quantize_dynamic(onnx_path, check_path, weight_type=QuantType.QInt8)
 
-    tok.backend_tokenizer.save(os.path.join(args.out, "tokenizer.json"))
-    cfg = agent.cfg
-    with open(os.path.join(args.out, "laya.json"), "w") as f:
-        json.dump({
-            "max_len": cfg.get("max_len", 512), "head_max_len": cfg.get("head_max_len", 192),
-            "mask_token": tok.mask_token, "mask_id": tok.mask_token_id, "cls_id": tok.cls_token_id,
-            "sep_id": tok.sep_token_id, "pad_id": tok.pad_token_id,
-            "temperature": list(agent.temperature), "temperature_by_options": dict(agent.temperature_by_options),
-        }, f, indent=2)
+    try:
+        tok.backend_tokenizer.save(os.path.join(args.out, "tokenizer.json"))
+        cfg = agent.cfg
+        with open(os.path.join(args.out, "laya.json"), "w") as f:
+            json.dump({
+                "max_len": cfg.get("max_len", 512), "head_max_len": cfg.get("head_max_len", 192),
+                "mask_token": tok.mask_token, "mask_id": tok.mask_token_id, "cls_id": tok.cls_token_id,
+                "sep_id": tok.sep_token_id, "pad_id": tok.pad_token_id,
+                "temperature": list(agent.temperature), "temperature_by_options": dict(agent.temperature_by_options),
+            }, f, indent=2)
 
-    here = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(here, "fixture_requests.json")) as f:
-        requests = json.load(f) + generated_cases()
-    sess = ort.InferenceSession(check_path, providers=["CPUExecutionProvider"])
-    fixtures, worst = [], 0.0
-    n_q = agree = 0
-    max_dp = max_dact = 0.0
-    for req in requests:
-        case = {"state": req["state"], "questions": req["questions"], "is_english": is_english(req["state"]),
-                "encoded": {}, "raw": {}, "errors": []}
-        items = []
-        for qid, qdef in req["questions"].items():
-            enc = encode(agent, req["state"], qdef)
-            if enc is None:
-                case["errors"].append(qid)
-                continue
-            with torch.no_grad():
-                t = {k: torch.from_numpy(v) for k, v in collate([enc], tok.pad_token_id).items()}
-                logits, act = wrapper(*(t[n] for n in names))
-            k = len(enc["markers"])
-            case["encoded"][qid] = {"ids": enc["ids"], "markers": enc["markers"]}
-            case["raw"][qid] = {"logits": logits[0, :k].tolist(), "act_prob": float(act[0]), "n_tokens": len(enc["ids"])}
-            items.append((qid, enc))
-        if not case["errors"]:
-            case["answers"] = agent.system_one(req["state"], req["questions"])["answers"]
-        if items:  # self-check: ORT on the padded mixed batch vs PyTorch single runs
-            out_logits, out_act = sess.run(None, collate([e for _, e in items], tok.pad_token_id))
-            for i, (qid, enc) in enumerate(items):
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "fixture_requests.json")) as f:
+            requests = json.load(f) + generated_cases()
+        sess = ort.InferenceSession(check_path, providers=["CPUExecutionProvider"])
+        fixtures, worst = [], 0.0
+        n_q = agree = 0
+        max_dp = max_dact = 0.0
+        for req in requests:
+            case = {"state": req["state"], "questions": req["questions"], "is_english": is_english(req["state"]),
+                    "encoded": {}, "raw": {}, "errors": []}
+            items = []
+            for qid, qdef in req["questions"].items():
+                enc = encode(agent, req["state"], qdef)
+                if enc is None:
+                    case["errors"].append(qid)
+                    continue
+                with torch.no_grad():
+                    t = {k: torch.from_numpy(v) for k, v in collate([enc], tok.pad_token_id).items()}
+                    logits, act = wrapper(*(t[n] for n in names))
                 k = len(enc["markers"])
-                ref = np.array(case["raw"][qid]["logits"])
-                worst = max(worst, float(np.abs(out_logits[i, :k] - ref).max()))
-                t = temperature(agent.temperature, agent.temperature_by_options, enc["qtype"], k)
-                p_ort, p_ref = softmax(out_logits[i, :k] / t), softmax(ref / t)
-                n_q += 1
-                agree += int(np.argmax(p_ort) == np.argmax(p_ref))
-                max_dp = max(max_dp, float(np.abs(p_ort - p_ref).max()))
-                max_dact = max(max_dact, abs(float(out_act[i]) - case["raw"][qid]["act_prob"]))
-        fixtures.append(case)
-    with open(os.path.join(args.out, "fixtures.json"), "w") as f:
-        json.dump(fixtures, f, ensure_ascii=False)
-    print(f"wrote {len(fixtures)} fixtures; worst ORT-vs-PyTorch logit diff {worst:.2e}")
-    print(f"top-1 agreement {agree}/{n_q}; max |Δp| {max_dp:.4f} (temperature-scaled); max |Δ act_prob| {max_dact:.4f}")
-    if args.quantize is None and worst > 1e-2:
-        raise SystemExit("parity self-check failed: ORT output differs from PyTorch")
-    if args.quantize == "int8":
-        del sess  # release the file before moving or deleting it
-        if agree < n_q or max_dp > 0.05 or max_dact > 0.05:
+                case["encoded"][qid] = {"ids": enc["ids"], "markers": enc["markers"]}
+                case["raw"][qid] = {"logits": logits[0, :k].tolist(), "act_prob": float(act[0]),
+                                     "n_tokens": len(enc["ids"])}
+                items.append((qid, enc))
+            if not case["errors"]:
+                case["answers"] = agent.system_one(req["state"], req["questions"])["answers"]
+            if items:  # self-check: ORT on the padded mixed batch vs PyTorch single runs
+                out_logits, out_act = sess.run(None, collate([e for _, e in items], tok.pad_token_id))
+                for i, (qid, enc) in enumerate(items):
+                    k = len(enc["markers"])
+                    ref = np.array(case["raw"][qid]["logits"])
+                    worst = max(worst, float(np.abs(out_logits[i, :k] - ref).max()))
+                    t = temperature(agent.temperature, agent.temperature_by_options, enc["qtype"], k)
+                    p_ort, p_ref = softmax(out_logits[i, :k] / t), softmax(ref / t)
+                    n_q += 1
+                    agree += int(np.argmax(p_ort) == np.argmax(p_ref))
+                    max_dp = max(max_dp, float(np.abs(p_ort - p_ref).max()))
+                    max_dact = max(max_dact, abs(float(out_act[i]) - case["raw"][qid]["act_prob"]))
+            fixtures.append(case)
+        with open(os.path.join(args.out, "fixtures.json"), "w") as f:
+            json.dump(fixtures, f, ensure_ascii=False)
+        print(f"wrote {len(fixtures)} fixtures; worst ORT-vs-PyTorch logit diff {worst:.2e}")
+        print(f"top-1 agreement {agree}/{n_q}; max |Δp| {max_dp:.4f} (temperature-scaled); "
+              f"max |Δ act_prob| {max_dact:.4f}")
+        if args.quantize is None and worst > 1e-2:
+            raise SystemExit("parity self-check failed: ORT output differs from PyTorch")
+        if args.quantize == "int8":
+            del sess  # release the file before moving or deleting it
+            if agree < n_q or max_dp > 0.05 or max_dact > 0.05:
+                raise SystemExit("int8 decision gate failed: top-1 must match on every question, |Δp| <= 0.05 and "
+                                 "|Δ act_prob| <= 0.05; kept the fp32 model.onnx")
+            os.replace(check_path, onnx_path)
+    finally:
+        # Any exception or interrupt before the gate (or a gate failure) leaves the int8 temp file
+        # behind unless we clean it up here; a successful gate already moved it onto onnx_path.
+        if check_path != onnx_path and os.path.exists(check_path):
             os.remove(check_path)
-            raise SystemExit("int8 decision gate failed: top-1 must match on every question, |Δp| <= 0.05 and "
-                             "|Δ act_prob| <= 0.05; kept the fp32 model.onnx")
-        os.replace(check_path, onnx_path)
 
 
 if __name__ == "__main__":
