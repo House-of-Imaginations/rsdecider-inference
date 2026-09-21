@@ -222,7 +222,7 @@ async fn batch_routes_each_item_independently() {
 async fn health_endpoints_need_no_auth() {
     use tower::ServiceExt;
     let (app, _) = app(config(|_| {}), &Fake::default()).await;
-    for p in ["/healthz", "/readyz"] {
+    for p in ["/healthz", "/readyz", "/openapi.yaml", "/docs"] {
         let r =
             app.clone().oneshot(axum::http::Request::get(p).body(axum::body::Body::empty()).unwrap()).await.unwrap();
         assert_eq!(r.status(), StatusCode::OK);

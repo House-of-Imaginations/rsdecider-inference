@@ -12,7 +12,7 @@ use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -151,12 +151,17 @@ pub async fn build(
     }))
 }
 
+const OPENAPI: &str = include_str!("../openapi.yaml");
+const DOCS: &str = include_str!("docs.html");
+
 pub fn router(st: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/decide", post(decide))
         .route("/v1/decide/batch", post(decide_batch))
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
+        .route("/openapi.yaml", get(|| async { ([(header::CONTENT_TYPE, "application/yaml")], OPENAPI) }))
+        .route("/docs", get(|| async { Html(DOCS) }))
         .layer(DefaultBodyLimit::max(st.cfg.limits.max_body_bytes))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(st)

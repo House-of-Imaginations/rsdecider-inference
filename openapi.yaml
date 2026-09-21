@@ -14,7 +14,8 @@ info:
   license:
     name: see repository
 servers:
-  - url: http://localhost:3000
+  - url: /
+    description: The server hosting this spec (Swagger UI at /docs)
 security:
   - apiKey: []
 
@@ -112,6 +113,22 @@ paths:
       security: []
       responses:
         '200': { description: Process is up, content: { text/plain: { schema: { type: string, const: ok } } } }
+
+  /openapi.yaml:
+    get:
+      summary: This OpenAPI document
+      operationId: openapi
+      security: []
+      responses:
+        '200': { description: OpenAPI 3.1 YAML, content: { application/yaml: { schema: { type: string } } } }
+
+  /docs:
+    get:
+      summary: Swagger UI for this API
+      operationId: docs
+      security: []
+      responses:
+        '200': { description: HTML page, content: { text/html: { schema: { type: string } } } }
 
   /readyz:
     get:

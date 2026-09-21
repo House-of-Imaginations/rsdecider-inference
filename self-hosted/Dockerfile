@@ -1,6 +1,6 @@
 FROM rust:1-bookworm AS build
 WORKDIR /src
-COPY Cargo.toml Cargo.lock rustfmt.toml ./
+COPY Cargo.toml Cargo.lock rustfmt.toml openapi.yaml ./
 COPY src src
 RUN cargo build --release && mkdir /out && cp target/release/rsdecider /out/ \
  && (cp target/release/*.so* /out/ 2>/dev/null || true)

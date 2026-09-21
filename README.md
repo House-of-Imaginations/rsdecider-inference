@@ -105,9 +105,12 @@ curl localhost:3000/readyz                                 # → ready
 | `POST` | `/v1/decide/batch` | Bearer key | `{"items": [ …decide bodies… ]}` — up to `limits.max_batch_states` states, each routed on its own. Returns `{"id", "results": [...]}`. |
 | `GET` | `/healthz` | — | Liveness: `ok`. |
 | `GET` | `/readyz` | — | `ready` while every model has a live worker, else `503`. |
+| `GET` | `/docs` | — | Swagger UI — browse the API and try requests (click **Authorize**, paste your key). |
+| `GET` | `/openapi.yaml` | — | The OpenAPI 3.1 document, embedded in the binary. |
 | `GET` | `:9000/metrics` | — | Prometheus exposition (separate listener, `server.metrics_listen`). |
 
-Full schema: **[`openapi.yaml`](./openapi.yaml)** (OpenAPI 3.1) — load it into Swagger UI, Redocly, Postman or an SDK generator.
+Full schema: **[`openapi.yaml`](./openapi.yaml)** (OpenAPI 3.1), also served live at `http://localhost:3000/docs` (Swagger UI,
+loaded from jsDelivr) and `/openapi.yaml` for Postman or SDK generators.
 
 <details>
 <summary><b>Question types</b></summary>
@@ -294,6 +297,7 @@ cargo test --features redis-tests --test redis                    # needs Docker
 src/
   main.rs          CLI (serve, hash-key), runtime + metrics setup
   api.rs           axum routes, request pipeline, errors
+  docs.html        Swagger UI page served at /docs
   auth.rs          hashed API keys + per-key governor limiter
   idempotency.rs   Redis SET NX with bounded moka fallback
   lang.rs          Laya routing (English vs multilingual)
