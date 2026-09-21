@@ -453,7 +453,8 @@ mod tests {
     }
 
     async fn sched(specs: Vec<ModelSpec>) -> Scheduler {
-        Scheduler::start(specs, Arc::new(Cache::new(&CacheCfg::default()).await.unwrap())).unwrap()
+        Scheduler::start(specs, Arc::new(Cache::new(&CacheCfg::default(), Duration::from_millis(250)).await.unwrap()))
+            .unwrap()
     }
 
     fn secs(n: u64) -> Instant {

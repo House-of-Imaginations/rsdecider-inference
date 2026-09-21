@@ -4,6 +4,7 @@ pub mod cache;
 pub mod config;
 pub mod fake;
 pub mod idempotency;
+pub mod knobs;
 pub mod lang;
 pub mod metrics;
 pub mod model;

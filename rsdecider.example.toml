@@ -40,6 +40,14 @@ l1_ttl_secs = 3600
 l2_ttl_secs = 86400
 idempotency_ttl_secs = 86400
 
+# Advanced limits; every field is optional (see src/knobs.rs).
+[knobs]
+# tokenize_queue             = 512      # requests tokenizing or waiting → 529 when full (default Σ max_pending)
+overloaded_retry_after_secs  = 1        # Retry-After on 529
+redis_timeout_ms             = 250      # per Redis command; then cache miss / local idempotency
+idempotency_local_max_bytes  = 67108864 # in-process idempotency store (64 MiB)
+idempotency_max_stored_bytes = 262144   # larger responses re-run on repeat (256 KiB)
+
 # Generate: rsdecider hash-key <secret>
 [[keys]]
 name = "dev"

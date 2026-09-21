@@ -44,7 +44,7 @@ pub enum ApiError {
     TooLarge,
     Invalid(String),
     RateLimited(Duration),
-    Overloaded,
+    Overloaded(Duration),
     Deadline,
     Internal(String),
 }
@@ -57,7 +57,7 @@ impl ApiError {
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
-            Self::Overloaded => StatusCode::from_u16(529).unwrap(),
+            Self::Overloaded(_) => StatusCode::from_u16(529).unwrap(),
             Self::Deadline => StatusCode::GATEWAY_TIMEOUT,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -74,9 +74,7 @@ impl IntoResponse for ApiError {
             Self::TooLarge => ("payload_too_large", "request body too large".into(), None),
             Self::Invalid(m) => ("invalid_request", m.clone(), None),
             Self::RateLimited(d) => ("rate_limited", "rate limit exceeded".into(), Some(*d)),
-            Self::Overloaded => {
-                ("overloaded", "server is at capacity, retry later".into(), Some(Duration::from_secs(1)))
-            }
+            Self::Overloaded(d) => ("overloaded", "server is at capacity, retry later".into(), Some(*d)),
             Self::Deadline => ("deadline_exceeded", "request timed out".into(), None),
             Self::Internal(_) => ("internal", "internal error".into(), None),
         };
@@ -132,20 +130,23 @@ pub async fn build(
         models.push(Arc::new(lm));
     }
     let by_name: HashMap<String, usize> = cfg.models.iter().enumerate().map(|(i, m)| (m.name.clone(), i)).collect();
-    let cache = Arc::new(Cache::new(&cfg.cache).await?);
+    let cache = Arc::new(Cache::new(&cfg.cache, cfg.knobs.redis_timeout()).await?);
     let sched = Scheduler::start(specs, cache.clone())?;
     let idem = Idem::new(
         cache.redis(),
         Duration::from_millis(cfg.server.request_timeout_ms),
         Duration::from_secs(cfg.cache.idempotency_ttl_secs),
+        &cfg.knobs,
     );
     Ok(Arc::new(AppState {
         english: by_name[&cfg.routing.english_model],
         non_english: by_name[&cfg.routing.non_english_model],
         auth: Arc::new(Auth::new(&cfg.keys)),
         tokenize: Arc::new(Semaphore::new(cfg.server.tokenize_threads.max(1))),
-        // same memory knob as the scheduler queues: requests past Σ max_pending can't be admitted anyway
-        tokenize_queue: Arc::new(Semaphore::new(cfg.models.iter().map(|m| m.max_pending).sum())),
+        // default: the scheduler queues' memory knob; requests past Σ max_pending can't be admitted anyway
+        tokenize_queue: Arc::new(Semaphore::new(
+            cfg.knobs.tokenize_queue.unwrap_or_else(|| cfg.models.iter().map(|m| m.max_pending).sum()),
+        )),
         models,
         by_name,
         cache,
@@ -360,7 +361,11 @@ async fn decide_items(
         let model = st.models[routes[i].0].clone();
         let (seg, preps) = (seg.clone(), missing.iter().map(|q| q.prep.clone()).collect::<Vec<_>>());
         // bounded wait: shed instead of holding the parsed request until its deadline
-        let queued = st.tokenize_queue.clone().try_acquire_owned().map_err(|_| ApiError::Overloaded)?;
+        let queued = st
+            .tokenize_queue
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ApiError::Overloaded(st.cfg.knobs.retry_after()))?;
         let permit = tokio::time::timeout_at(deadline, st.tokenize.clone().acquire_owned())
             .await
             .map_err(|_| ApiError::Deadline)?
@@ -389,7 +394,7 @@ async fn decide_items(
     // Steps 4-7: admission, batching, inference.
     if !jobs.is_empty() {
         let computed = st.sched.run_jobs(jobs, deadline).await.map_err(|e| match e {
-            SchedError::Overloaded => ApiError::Overloaded,
+            SchedError::Overloaded => ApiError::Overloaded(st.cfg.knobs.retry_after()),
             SchedError::Deadline => ApiError::Deadline,
             SchedError::Backend(m) => ApiError::Internal(m),
         })?;

@@ -1,3 +1,4 @@
+use crate::knobs::Knobs;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,8 @@ pub struct Config {
     pub cache: CacheCfg,
     #[serde(default)]
     pub keys: Vec<KeyCfg>,
+    #[serde(default)]
+    pub knobs: Knobs,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -171,6 +174,7 @@ impl Config {
                 return Err(format!("routing names unknown model {r:?}"));
             }
         }
+        self.knobs.validate()?;
         if self.limits.max_batch_states == 0 || self.limits.max_questions_per_state == 0 {
             return Err("limits must be >= 1".into());
         }
@@ -229,6 +233,26 @@ burst = 40
         assert_eq!(c.models[0].max_pending, 256);
         assert_eq!(c.models[0].execution_provider, "cpu");
         assert_eq!(c.cache.redis_url, None);
+    }
+
+    #[test]
+    fn shipped_configs_parse() {
+        for f in ["rsdecider.example.toml", "self-hosted/rsdecider.toml", "stress/rsdecider.stress.toml"] {
+            Config::load(Path::new(f)).unwrap_or_else(|e| panic!("{f}: {e}"));
+        }
+    }
+
+    #[test]
+    fn knobs_parse_and_validate() {
+        let c = Config::from_toml_str(BASE).unwrap();
+        assert_eq!((c.knobs.tokenize_queue, c.knobs.redis_timeout_ms), (None, 250));
+        let c =
+            Config::from_toml_str(&format!("{BASE}\n[knobs]\ntokenize_queue = 64\nredis_timeout_ms = 100\n")).unwrap();
+        assert_eq!((c.knobs.tokenize_queue, c.knobs.redis_timeout_ms), (Some(64), 100));
+        let err = |k: &str| Config::from_toml_str(&format!("{BASE}\n[knobs]\n{k}\n")).unwrap_err();
+        assert!(err("redis_timeout_ms = 0").contains("knobs.redis_timeout_ms"));
+        assert!(err("idempotency_max_stored_bytes = 999999999999").contains("idempotency_local_max_bytes"));
+        assert!(err("redis_timout_ms = 5").contains("unknown field"), "typos are rejected");
     }
 
     #[test]

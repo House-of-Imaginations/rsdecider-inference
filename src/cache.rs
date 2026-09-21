@@ -11,7 +11,6 @@ pub type Key = [u8; 32];
 
 /// Bump whenever sequence construction or the cached value format changes.
 pub const CACHE_SCHEMA: &[u8] = b"rsdecider-cache-v1";
-pub const REDIS_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// sha256(schema ‖ fingerprint ‖ qtype ‖ len(seg)‖seg ...), u64-LE lengths.
 pub fn key(fingerprint: &[u8; 32], qtype: QType, segments: &[&str]) -> Key {
@@ -36,6 +35,7 @@ pub struct Cache {
     l1: moka::sync::Cache<Key, Arc<Raw>>,
     redis: Option<ConnectionManager>,
     l2_ttl_secs: u64,
+    timeout: Duration,
 }
 
 pub fn redis_error(e: impl std::fmt::Display) {
@@ -45,7 +45,7 @@ pub fn redis_error(e: impl std::fmt::Display) {
 
 impl Cache {
     /// Connects to Redis when `redis_url` is set (startup fails if it is unreachable).
-    pub async fn new(cfg: &CacheCfg) -> Result<Self, String> {
+    pub async fn new(cfg: &CacheCfg, redis_timeout: Duration) -> Result<Self, String> {
         let redis = match &cfg.redis_url {
             Some(url) => {
                 let client = redis::Client::open(url.as_str()).map_err(|e| e.to_string())?;
@@ -62,7 +62,7 @@ impl Cache {
             .weigher(|_k: &Key, v: &Arc<Raw>| (96 + v.logits.len() * 4) as u32)
             .time_to_live(Duration::from_secs(cfg.l1_ttl_secs))
             .build();
-        Ok(Self { l1, redis, l2_ttl_secs: cfg.l2_ttl_secs })
+        Ok(Self { l1, redis, l2_ttl_secs: cfg.l2_ttl_secs, timeout: redis_timeout })
     }
 
     pub fn redis(&self) -> Option<ConnectionManager> {
@@ -82,7 +82,7 @@ impl Cache {
         let mut con = self.redis.clone()?;
         let mut cmd = redis::cmd("GET");
         cmd.arg(redis_key(k));
-        let s = match tokio::time::timeout(REDIS_TIMEOUT, cmd.query_async::<Option<String>>(&mut con)).await {
+        let s = match tokio::time::timeout(self.timeout, cmd.query_async::<Option<String>>(&mut con)).await {
             Ok(Ok(s)) => s?,
             Ok(Err(e)) => {
                 redis_error(e);
@@ -113,7 +113,7 @@ impl Cache {
         let val = serde_json::to_string(&*v).expect("Raw serializes");
         let mut cmd = redis::cmd("SET");
         cmd.arg(redis_key(&k)).arg(val).arg("EX").arg(self.l2_ttl_secs);
-        match tokio::time::timeout(REDIS_TIMEOUT, cmd.query_async::<()>(&mut con)).await {
+        match tokio::time::timeout(self.timeout, cmd.query_async::<()>(&mut con)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => redis_error(e),
             Err(_) => redis_error("SET timeout"),
@@ -148,7 +148,7 @@ mod tests {
 
     #[tokio::test]
     async fn l1_roundtrip_without_redis() {
-        let c = Cache::new(&CacheCfg::default()).await.unwrap();
+        let c = Cache::new(&CacheCfg::default(), Duration::from_millis(250)).await.unwrap();
         let k = key(&FP, QType::Noul, &["x"]);
         assert!(c.get(&k, 2).await.is_none());
         c.put_l1(k, Arc::new(Raw { logits: vec![0.1, 0.2], act_prob: 0.5, n_tokens: 3 }));
@@ -158,7 +158,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_length_raw_is_a_miss() {
-        let c = Cache::new(&CacheCfg::default()).await.unwrap();
+        let c = Cache::new(&CacheCfg::default(), Duration::from_millis(250)).await.unwrap();
         let k = key(&FP, QType::Choice, &["x"]);
         c.put_l1(k, Arc::new(Raw { logits: vec![0.1, 0.2], act_prob: 0.5, n_tokens: 3 }));
         assert!(c.get(&k, 3).await.is_none());

@@ -233,6 +233,13 @@ name   = "my-app"                       # shows up in metrics and logs
 sha256 = "…64 lowercase hex…"           # rsdecider hash-key <secret>
 rps    = 50                             # sustained questions/s (batch items count individually)
 burst  = 100
+
+[knobs]                                 # advanced; every field optional (src/knobs.rs)
+# tokenize_queue             = 512      # requests tokenizing or waiting → 529 when full (default Σ max_pending)
+overloaded_retry_after_secs  = 1        # Retry-After on 529
+redis_timeout_ms             = 250      # per Redis command; then cache miss / local idempotency
+idempotency_local_max_bytes  = 67108864 # in-process idempotency store (64 MiB)
+idempotency_max_stored_bytes = 262144   # larger responses re-run on repeat (256 KiB)
 ```
 
 The server refuses to start on an invalid file (unknown routing target, duplicate names, zero workers, bad key hash)
@@ -267,16 +274,15 @@ first, then set the queues from the throughput you measure (the `rsdecider_*` me
 - **Biggest lever:** cold capacity is inference-bound, so an int8 export (`tools/export_onnx.py --quantize int8`) or a
   GPU (`cargo build --release --features cuda`, `execution_provider = "cuda"`) beats any server knob.
 
-<details>
-<summary><b>Fixed in code</b> (change the constant and rebuild)</summary>
+**Advanced `[knobs]`** ([`src/knobs.rs`](./src/knobs.rs)): rarely needed, but tunable without a rebuild.
 
-| Constant | Value | Where |
+| Knob | Default | Tune it when |
 |---|---|---|
-| In-process idempotency store | 64 MiB | `src/idempotency.rs` `LOCAL_MAX_BYTES` |
-| Largest stored idempotent response | 256 KiB; larger ones re-run on repeat | `src/idempotency.rs` `MAX_STORED_BYTES` |
-| Redis command timeout | 250 ms (then falls back to local) | `src/cache.rs` `REDIS_TIMEOUT` |
-| `Retry-After` on `529` | 1 s | `src/api.rs` |
-</details>
+| `knobs.tokenize_queue` | `Σ max_pending` | you want to shed before tokenization sooner (tight memory, large bodies) or later |
+| `knobs.overloaded_retry_after_secs` | `1` | clients should back off longer after a `529` |
+| `knobs.redis_timeout_ms` | `250` | Redis is remote or slow (raise) or you'd rather miss fast (lower) |
+| `knobs.idempotency_local_max_bytes` | 64 MiB | no Redis and many `Idempotency-Key` clients |
+| `knobs.idempotency_max_stored_bytes` | 256 KiB | responses are large and must still replay |
 
 ## Self-hosted (Docker)
 
@@ -360,6 +366,7 @@ src/
   scheduler.rs     coalescing, admission, micro-batcher, ORT worker pool
   model/           tokenization, Laya sequence encoding, ONNX session, postprocess
   config.rs        rsdecider.toml schema + validation
+  knobs.rs         advanced [knobs] limits and their defaults
 tests/             api, parity, redis, e2e suites
 tools/             export_onnx.py (PyTorch → ONNX + fixtures)
 stress/            k6 scenarios, runner, results

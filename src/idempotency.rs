@@ -1,5 +1,6 @@
 //! Idempotency-Key records: Redis when available, in-process map otherwise (single instance only).
-use crate::cache::{REDIS_TIMEOUT, redis_error};
+use crate::cache::redis_error;
+use crate::knobs::Knobs;
 use moka::ops::compute::Op;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
@@ -33,15 +34,13 @@ pub struct Idem {
     local: moka::sync::Cache<String, Entry>,
     pending_ttl: Duration,
     done_ttl: Duration,
+    max_stored_bytes: usize,
+    redis_timeout: Duration,
 }
 
 /// Record, its deadline, and its weight in bytes (the serialized size).
 type Entry = (Record, Instant, u32);
 
-/// Bytes the in-process map may hold across all keys.
-const LOCAL_MAX_BYTES: u64 = 64 << 20;
-/// Larger responses are not stored: a repeat runs again instead of pinning memory.
-pub const MAX_STORED_BYTES: usize = 256 << 10;
 /// Weight of a pending record (hashes + owner id).
 const PENDING_BYTES: u32 = 160;
 
@@ -50,13 +49,20 @@ if v and cjson.decode(v).owner == ARGV[1] then return redis.call('DEL', KEYS[1])
 return 0";
 
 impl Idem {
-    pub fn new(redis: Option<ConnectionManager>, request_timeout: Duration, done_ttl: Duration) -> Self {
+    pub fn new(redis: Option<ConnectionManager>, request_timeout: Duration, done_ttl: Duration, knobs: &Knobs) -> Self {
         let local = moka::sync::Cache::builder()
-            .max_capacity(LOCAL_MAX_BYTES)
+            .max_capacity(knobs.idempotency_local_max_bytes)
             .weigher(|k: &String, v: &Entry| (k.len() as u32).saturating_add(v.2))
             .expire_after(ExpiresAt)
             .build();
-        Self { redis, local, pending_ttl: request_timeout + Duration::from_secs(5), done_ttl }
+        Self {
+            redis,
+            local,
+            pending_ttl: request_timeout + Duration::from_secs(5),
+            done_ttl,
+            max_stored_bytes: knobs.idempotency_max_stored_bytes,
+            redis_timeout: knobs.redis_timeout(),
+        }
     }
 
     pub async fn begin(&self, key_name: &str, idem_key: &str, body_sha: &str, owner: &str) -> Begin {
@@ -91,15 +97,15 @@ impl Idem {
         for _ in 0..3 {
             let mut set = redis::cmd("SET");
             set.arg(k).arg(&val).arg("NX").arg("PX").arg(self.pending_ttl.as_millis() as u64);
-            if timed(set.query_async::<Option<String>>(&mut con)).await?.is_some() {
+            if timed(self.redis_timeout, set.query_async::<Option<String>>(&mut con)).await?.is_some() {
                 return Ok(None);
             }
             let mut get = redis::cmd("GET");
             get.arg(k);
             let mut pttl = redis::cmd("PTTL");
             pttl.arg(k);
-            let cur = timed(get.query_async::<Option<String>>(&mut con)).await?;
-            let ttl_ms = timed(pttl.query_async::<i64>(&mut con)).await?;
+            let cur = timed(self.redis_timeout, get.query_async::<Option<String>>(&mut con)).await?;
+            let ttl_ms = timed(self.redis_timeout, pttl.query_async::<i64>(&mut con)).await?;
             if let Some(s) = cur {
                 let rec: Record = serde_json::from_str(&s).map_err(|e| e.to_string())?;
                 return Ok(Some(existing(&rec, body_sha, Duration::from_millis(ttl_ms.max(1000) as u64))));
@@ -109,7 +115,7 @@ impl Idem {
     }
 
     /// `response` = Some(body) on 200 (stored for replay), None on any error (record released).
-    /// A response over `MAX_STORED_BYTES` is treated like an error: released, not stored.
+    /// A response over `knobs.idempotency_max_stored_bytes` is treated like an error: released, not stored.
     pub async fn finish(&self, g: Guard, response: Option<&Value>) {
         let done = response
             .map(|r| Record::Done { body_sha: g.body_sha.clone(), response: r.clone() })
@@ -117,7 +123,7 @@ impl Idem {
                 let json = serde_json::to_string(&rec).unwrap();
                 (rec, json)
             })
-            .filter(|(_, json)| json.len() <= MAX_STORED_BYTES);
+            .filter(|(_, json)| json.len() <= self.max_stored_bytes);
         if !g.local
             && let Some(mut con) = self.redis.clone()
         {
@@ -125,13 +131,13 @@ impl Idem {
                 Some((_, json)) => {
                     let mut set = redis::cmd("SET");
                     set.arg(&g.rec_key).arg(json).arg("PX").arg(self.done_ttl.as_millis() as u64);
-                    timed(set.query_async::<()>(&mut con)).await
+                    timed(self.redis_timeout, set.query_async::<()>(&mut con)).await
                 }
                 None => {
                     let script = redis::Script::new(DEL_IF_OWNER);
                     let mut inv = script.key(&g.rec_key);
                     inv.arg(&g.owner);
-                    timed(inv.invoke_async::<i64>(&mut con)).await.map(|_| ())
+                    timed(self.redis_timeout, inv.invoke_async::<i64>(&mut con)).await.map(|_| ())
                 }
             };
             if let Err(e) = res {
@@ -175,8 +181,8 @@ fn existing(rec: &Record, body_sha: &str, remaining: Duration) -> Begin {
     }
 }
 
-async fn timed<T>(f: impl Future<Output = redis::RedisResult<T>>) -> Result<T, String> {
-    match tokio::time::timeout(REDIS_TIMEOUT, f).await {
+async fn timed<T>(t: Duration, f: impl Future<Output = redis::RedisResult<T>>) -> Result<T, String> {
+    match tokio::time::timeout(t, f).await {
         Ok(r) => r.map_err(|e| e.to_string()),
         Err(_) => Err("timeout".into()),
     }
@@ -188,7 +194,7 @@ mod tests {
     use serde_json::json;
 
     fn idem() -> Idem {
-        Idem::new(None, Duration::from_secs(10), Duration::from_secs(60))
+        Idem::new(None, Duration::from_secs(10), Duration::from_secs(60), &Knobs::default())
     }
 
     #[tokio::test]
@@ -220,20 +226,26 @@ mod tests {
     async fn oversized_responses_are_released_not_stored() {
         let i = idem();
         let Begin::Proceed(g) = i.begin("acme", "k1", "sha-a", "req1").await else { panic!() };
-        i.finish(g, Some(&json!("x".repeat(MAX_STORED_BYTES)))).await;
+        i.finish(g, Some(&json!("x".repeat(Knobs::default().idempotency_max_stored_bytes)))).await;
         assert!(matches!(i.begin("acme", "k1", "sha-a", "req2").await, Begin::Proceed(_)));
     }
 
     #[tokio::test]
     async fn local_map_is_bounded_by_bytes() {
         let i = idem();
-        let big = json!("x".repeat(MAX_STORED_BYTES - 100));
-        for n in 0..(2 * LOCAL_MAX_BYTES as usize / MAX_STORED_BYTES) {
+        let big = json!("x".repeat(Knobs::default().idempotency_max_stored_bytes - 100));
+        for n in 0..(2 * Knobs::default().idempotency_local_max_bytes as usize
+            / Knobs::default().idempotency_max_stored_bytes)
+        {
             let Begin::Proceed(g) = i.begin("acme", &format!("k{n}"), "sha", "req").await else { panic!() };
             i.finish(g, Some(&big)).await;
         }
         i.local.run_pending_tasks();
-        assert!(i.local.weighted_size() <= LOCAL_MAX_BYTES, "{} bytes held", i.local.weighted_size());
+        assert!(
+            i.local.weighted_size() <= Knobs::default().idempotency_local_max_bytes,
+            "{} bytes held",
+            i.local.weighted_size()
+        );
     }
 
     #[tokio::test]
