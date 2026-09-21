@@ -1,11 +1,9 @@
 name: docker
 
-# heavy check: pull requests and main only
+# image build: main only
 on:
   push:
     branches: [main]
-    paths: ['self-hosted/**', 'src/**', 'openapi.yaml', 'Cargo.toml', 'Cargo.lock', '.github/workflows/docker.yml']
-  pull_request:
     paths: ['self-hosted/**', 'src/**', 'openapi.yaml', 'Cargo.toml', 'Cargo.lock', '.github/workflows/docker.yml']
 
 concurrency:
