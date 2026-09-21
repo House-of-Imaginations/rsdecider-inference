@@ -1,10 +1,9 @@
 //! Idempotency-Key records: Redis when available, in-process map otherwise (single instance only).
 use crate::cache::{REDIS_TIMEOUT, redis_error};
+use moka::ops::compute::Op;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -31,7 +30,7 @@ pub struct Guard {
 
 pub struct Idem {
     redis: Option<ConnectionManager>,
-    local: Mutex<HashMap<String, (Record, Instant)>>,
+    local: moka::sync::Cache<String, (Record, Instant)>,
     pending_ttl: Duration,
     done_ttl: Duration,
 }
@@ -42,7 +41,9 @@ return 0";
 
 impl Idem {
     pub fn new(redis: Option<ConnectionManager>, request_timeout: Duration, done_ttl: Duration) -> Self {
-        Self { redis, local: Mutex::default(), pending_ttl: request_timeout + Duration::from_secs(5), done_ttl }
+        // ponytail: bounded by entry count, not bytes; ~100k × response size. Weigh by bytes if Done bodies grow.
+        let local = moka::sync::Cache::builder().max_capacity(100_000).expire_after(ExpiresAt).build();
+        Self { redis, local, pending_ttl: request_timeout + Duration::from_secs(5), done_ttl }
     }
 
     pub async fn begin(&self, key_name: &str, idem_key: &str, body_sha: &str, owner: &str) -> Begin {
@@ -57,17 +58,12 @@ impl Idem {
             }
         }
         let now = Instant::now();
-        let mut map = self.local.lock().unwrap();
-        if map.len() > 100_000 {
-            map.retain(|_, (_, exp)| *exp > now); // ponytail: lazy sweep instead of a janitor task
+        let e = self.local.entry(rec_key.clone()).or_insert_with(|| (pending, now + self.pending_ttl));
+        if e.is_fresh() {
+            return Begin::Proceed(guard(true));
         }
-        match map.get(&rec_key) {
-            Some((rec, exp)) if *exp > now => existing(rec, body_sha, *exp - now),
-            _ => {
-                map.insert(rec_key.clone(), (pending, now + self.pending_ttl));
-                Begin::Proceed(guard(true))
-            }
-        }
+        let (rec, exp) = e.into_value();
+        existing(&rec, body_sha, exp.saturating_duration_since(now))
     }
 
     /// Ok(None) = we own a fresh pending record.
@@ -126,18 +122,37 @@ impl Idem {
             }
             return;
         }
-        let mut map = self.local.lock().unwrap();
         match response {
             Some(r) => {
                 let rec = Record::Done { body_sha: g.body_sha, response: r.clone() };
-                map.insert(g.rec_key, (rec, Instant::now() + self.done_ttl));
+                self.local.insert(g.rec_key, (rec, Instant::now() + self.done_ttl));
             }
             None => {
-                if matches!(map.get(&g.rec_key), Some((Record::Pending { owner, .. }, _)) if *owner == g.owner) {
-                    map.remove(&g.rec_key);
-                }
+                self.local.entry(g.rec_key).and_compute_with(|cur| match cur.map(|e| e.into_value()) {
+                    Some((Record::Pending { owner, .. }, _)) if owner == g.owner => Op::Remove,
+                    _ => Op::Nop,
+                });
             }
         }
+    }
+}
+
+/// Per-entry expiry: each record carries its own deadline (pending vs done TTL).
+struct ExpiresAt;
+
+impl moka::Expiry<String, (Record, Instant)> for ExpiresAt {
+    fn expire_after_create(&self, _: &String, v: &(Record, Instant), now: Instant) -> Option<Duration> {
+        Some(v.1.saturating_duration_since(now))
+    }
+
+    fn expire_after_update(
+        &self,
+        _: &String,
+        v: &(Record, Instant),
+        now: Instant,
+        _: Option<Duration>,
+    ) -> Option<Duration> {
+        Some(v.1.saturating_duration_since(now))
     }
 }
 
@@ -183,6 +198,15 @@ mod tests {
         let i = idem();
         let Begin::Proceed(g) = i.begin("acme", "k1", "sha-a", "req1").await else { panic!() };
         i.finish(g, None).await;
+        assert!(matches!(i.begin("acme", "k1", "sha-a", "req2").await, Begin::Proceed(_)));
+    }
+
+    #[tokio::test]
+    async fn pending_record_expires_on_its_own_ttl() {
+        let mut i = idem();
+        i.pending_ttl = Duration::from_millis(50);
+        let Begin::Proceed(_abandoned) = i.begin("acme", "k1", "sha-a", "req1").await else { panic!() };
+        tokio::time::sleep(Duration::from_millis(120)).await;
         assert!(matches!(i.begin("acme", "k1", "sha-a", "req2").await, Begin::Proceed(_)));
     }
 }
