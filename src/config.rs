@@ -147,6 +147,9 @@ impl Config {
         if self.models.is_empty() {
             return Err("at least one [[models]] entry is required".into());
         }
+        if self.server.worker_threads == 0 {
+            return Err("server.worker_threads must be >= 1".into());
+        }
         let mut names = std::collections::HashSet::new();
         for m in &self.models {
             if !names.insert(m.name.as_str()) {
@@ -254,5 +257,11 @@ burst = 40
     fn rejects_bad_hash() {
         let s = BASE.replace("9f86d081", "XYZ");
         assert!(Config::from_toml_str(&s).unwrap_err().contains("sha256"));
+    }
+
+    #[test]
+    fn rejects_zero_worker_threads() {
+        let s = format!("[server]\nworker_threads = 0\n{BASE}");
+        assert!(Config::from_toml_str(&s).unwrap_err().contains("worker_threads"));
     }
 }

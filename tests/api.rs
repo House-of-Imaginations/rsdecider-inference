@@ -178,8 +178,9 @@ async fn idempotency_replays_conflicts_and_rejects_mismatch() {
     assert!(hd.contains_key("retry-after"));
     let (s1, _, b1) = first.await.unwrap();
     assert_eq!(s1, StatusCode::OK);
-    let (s2, _, b2) = call(&app, "/v1/decide", decide_body("x", "q"), &h).await;
+    let (s2, h2, b2) = call(&app, "/v1/decide", decide_body("x", "q"), &h).await;
     assert_eq!((s2, &b2), (StatusCode::OK, &b1), "replay returns the stored response, same id");
+    assert_eq!(h2["x-request-id"], b2["id"].as_str().unwrap(), "replay header carries the original id");
     assert_eq!(call(&app, "/v1/decide", decide_body("different", "q"), &h).await.0, StatusCode::UNPROCESSABLE_ENTITY);
 }
 

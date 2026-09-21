@@ -59,6 +59,15 @@ async fn serve(cfg: Config, path: PathBuf, fake_delay_ms: Option<u64>) -> Result
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let prom = metrics::install()?;
+    // Histograms only drain on render(); upkeep keeps them bounded when nothing scrapes /metrics.
+    let upkeep = prom.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            upkeep.run_upkeep();
+        }
+    });
 
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let threads = cfg.server.worker_threads

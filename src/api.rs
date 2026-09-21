@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
+use tracing::Instrument;
 
 #[derive(Debug, Deserialize)]
 pub struct DecideReq {
@@ -179,7 +180,9 @@ async fn handle(st: Arc<AppState>, headers: HeaderMap, body: Result<Bytes, Bytes
     let id = format!("req_{}", ulid::Ulid::generate());
     let deadline = tokio::time::Instant::now() + Duration::from_millis(st.cfg.server.request_timeout_ms);
     let mut key_name = "-".to_string();
-    let result = run(&st, &headers, body, batch, &id, deadline, &mut key_name).await;
+    let result = run(&st, &headers, body, batch, &id, deadline, &mut key_name)
+        .instrument(tracing::info_span!("request", request_id = %id))
+        .await;
     let status = result.as_ref().map_or_else(|e| e.status(), |_| StatusCode::OK);
     if let Err(ApiError::Internal(m)) = &result {
         tracing::error!(request_id = %id, "internal error: {m}");
@@ -187,11 +190,14 @@ async fn handle(st: Arc<AppState>, headers: HeaderMap, body: Result<Bytes, Bytes
     metrics::counter!("rsdecider_requests_total", "key" => key_name, "status" => status.as_u16().to_string())
         .increment(1);
     metrics::histogram!("rsdecider_request_seconds").record(started.elapsed().as_secs_f64());
+    // An idempotent replay carries the original request's id; the header must match the body.
+    let rid = result.as_ref().ok().and_then(|v| v["id"].as_str()).and_then(|s| HeaderValue::from_str(s).ok());
+    let rid = rid.unwrap_or_else(|| HeaderValue::from_str(&id).unwrap());
     let mut resp = match result {
         Ok(v) => Json(v).into_response(),
         Err(e) => e.into_response(),
     };
-    resp.headers_mut().insert("x-request-id", HeaderValue::from_str(&id).unwrap());
+    resp.headers_mut().insert("x-request-id", rid);
     resp
 }
 
@@ -334,12 +340,22 @@ async fn decide_items(
         }
         let model = st.models[routes[i].0].clone();
         let (seg, preps) = (seg.clone(), missing.iter().map(|q| q.prep.clone()).collect::<Vec<_>>());
-        let _permit = st.tokenize.acquire().await.expect("semaphore never closed");
-        let encoded = tokio::task::spawn_blocking(move || {
-            let ids = model.tokenize(&seg)?;
-            Ok::<_, String>(preps.iter().map(|p| encode(&model, &ids, p)).collect::<Vec<_>>())
-        })
+        let permit = tokio::time::timeout_at(deadline, st.tokenize.clone().acquire_owned())
+            .await
+            .map_err(|_| ApiError::Deadline)?
+            .expect("semaphore never closed");
+        // The permit moves into the closure so it is held until tokenization really ends, even if
+        // the request is dropped or times out first (keeps concurrency <= tokenize_threads).
+        let encoded = tokio::time::timeout_at(
+            deadline,
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let ids = model.tokenize(&seg)?;
+                Ok::<_, String>(preps.iter().map(|p| encode(&model, &ids, p)).collect::<Vec<_>>())
+            }),
+        )
         .await
+        .map_err(|_| ApiError::Deadline)?
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .map_err(ApiError::Internal)?;
         for (q, enc) in missing.iter().zip(encoded) {
