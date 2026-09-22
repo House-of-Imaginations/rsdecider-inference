@@ -179,18 +179,17 @@ def main():
                       "logits": {0: "B", 1: "K"}, "act_prob": {0: "B"}},
     )
     check_path = onnx_path
-    if args.quantize == "int8":  # quantize beside the fp32; it replaces model.onnx only if the gate passes
-        from onnxruntime.quantization import QuantType, quantize_dynamic
-        check_path = os.path.join(args.out, "model.int8.onnx")
-        quantize_dynamic(onnx_path, check_path, weight_type=QuantType.QInt8)
-    elif args.quantize == "w8":  # 8-bit weight-only (MatMulNBits); quantize beside the fp32, same gate as int8
-        from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
-        check_path = os.path.join(args.out, "model.w8.onnx")
-        quantizer = MatMulNBitsQuantizer(onnx_path, bits=8, block_size=128, is_symmetric=True, accuracy_level=4)
-        quantizer.process()
-        quantizer.model.save_model_to_file(check_path, use_external_data_format=False)
-
-    try:
+    try:  # check_path is set before quantizing starts, so the finally below removes a partial file too
+        if args.quantize == "int8":  # quantize beside the fp32; it replaces model.onnx only if the gate passes
+            from onnxruntime.quantization import QuantType, quantize_dynamic
+            check_path = os.path.join(args.out, "model.int8.onnx")
+            quantize_dynamic(onnx_path, check_path, weight_type=QuantType.QInt8)
+        elif args.quantize == "w8":  # 8-bit weight-only (MatMulNBits); quantize beside the fp32, same gate as int8
+            from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
+            check_path = os.path.join(args.out, "model.w8.onnx")
+            quantizer = MatMulNBitsQuantizer(onnx_path, bits=8, block_size=128, is_symmetric=True, accuracy_level=4)
+            quantizer.process()
+            quantizer.model.save_model_to_file(check_path, use_external_data_format=False)
         tok.backend_tokenizer.save(os.path.join(args.out, "tokenizer.json"))
         cfg = agent.cfg
         with open(os.path.join(args.out, "laya.json"), "w") as f:
