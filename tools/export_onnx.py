@@ -7,6 +7,7 @@ Usage:
 Writes <out>/model.onnx, tokenizer.json, laya.json, fixtures.json and self-checks ORT vs PyTorch.
 """
 import argparse
+import hashlib
 import json
 import os
 import types
@@ -148,6 +149,19 @@ def generated_cases():
     ]
 
 
+def write_manifest(out):
+    """manifest.json: size + sha256 of every served file, so rsdecider can verify (and download) the folder."""
+    files = {}
+    for name in ("model.onnx", "tokenizer.json", "laya.json", "fixtures.json"):
+        h = hashlib.sha256()
+        with open(os.path.join(out, name), "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        files[name] = {"size": os.path.getsize(os.path.join(out, name)), "sha256": h.hexdigest()}
+    with open(os.path.join(out, "manifest.json"), "w") as f:
+        json.dump({"files": files}, f, indent=2)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default="convaiinnovations/laya")
@@ -277,6 +291,7 @@ def main():
         # behind unless we clean it up here; a successful gate already moved it onto onnx_path.
         if check_path != onnx_path and os.path.exists(check_path):
             os.remove(check_path)
+    write_manifest(args.out)  # last: only a folder whose model.onnx is final gets a manifest
 
 
 if __name__ == "__main__":
