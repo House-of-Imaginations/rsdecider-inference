@@ -131,7 +131,7 @@ pub async fn build(
     }
     let by_name: HashMap<String, usize> = cfg.models.iter().enumerate().map(|(i, m)| (m.name.clone(), i)).collect();
     let cache = Arc::new(Cache::new(&cfg.cache, cfg.knobs.redis_timeout()).await?);
-    let sched = Scheduler::start(specs, cache.clone())?;
+    let sched = Scheduler::start(specs, cache.clone(), cfg.knobs.admission_headroom)?;
     let idem = Idem::new(
         cache.redis(),
         Duration::from_millis(cfg.server.request_timeout_ms),

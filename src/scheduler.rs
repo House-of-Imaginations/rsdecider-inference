@@ -117,12 +117,14 @@ pub struct Scheduler {
     map: Map,
     models: Arc<Vec<ModelQueue>>,
     next_gen: Arc<AtomicU64>,
+    /// `knobs.admission_headroom`: fraction of the remaining deadline a predicted finish may fill.
+    headroom: f64,
 }
 
 impl Scheduler {
     /// Spawns worker threads (each builds its backend; any failure aborts startup) and one batcher
     /// task per model. Must be called inside a tokio runtime.
-    pub fn start(specs: Vec<ModelSpec>, cache: Arc<Cache>) -> Result<Self, String> {
+    pub fn start(specs: Vec<ModelSpec>, cache: Arc<Cache>, admission_headroom: f64) -> Result<Self, String> {
         let rt = tokio::runtime::Handle::current();
         let map: Map = Arc::default();
         let mut models = Vec::new();
@@ -171,7 +173,7 @@ impl Scheduler {
                 queued_tokens: Arc::default(),
             });
         }
-        Ok(Self { map, models: Arc::new(models), next_gen: Arc::default() })
+        Ok(Self { map, models: Arc::new(models), next_gen: Arc::default(), headroom: admission_headroom })
     }
 
     /// Every model has at least one live worker.
@@ -242,14 +244,17 @@ impl Scheduler {
                     continue;
                 }
                 let q = &self.models[m];
-                // Shed now if the work already queued ahead plus this request cannot finish before the
-                // deadline (fast 529, not a late 504). An idle queue always admits, so a stale high
-                // estimate can't shed large requests forever.
+                // Shed now if the work already queued ahead plus this request cannot finish within
+                // `headroom` of the deadline (fast 529, not a late 504). The estimate is a mean (EMA)
+                // cost, but real batch times scatter up to ~1.2x it, so admitting all the way to the
+                // full deadline turns saturation into late 504s instead of fast 529s; headroom leaves
+                // room for that scatter. An idle queue always admits, so a stale high estimate can't
+                // shed large requests forever.
                 let spt = f64::from_bits(q.secs_per_token.load(Ordering::Relaxed));
                 let ahead = q.queued_tokens.load(Ordering::Relaxed);
                 let own: usize = fresh.iter().filter(|j| j.model == m).map(|j| j.enc.ids.len()).sum();
                 let left = deadline.saturating_duration_since(Instant::now()).as_secs_f64();
-                if spt > 0.0 && ahead > 0 && (ahead + own) as f64 * spt / q.workers as f64 > left {
+                if spt > 0.0 && ahead > 0 && (ahead + own) as f64 * spt / q.workers as f64 > self.headroom * left {
                     metrics::counter!("rsdecider_shed_total", "model" => q.name.clone()).increment(1);
                     return Err(SchedError::Overloaded);
                 }
@@ -491,8 +496,8 @@ mod tests {
     }
 
     async fn sched(specs: Vec<ModelSpec>) -> Scheduler {
-        Scheduler::start(specs, Arc::new(Cache::new(&CacheCfg::default(), Duration::from_millis(250)).await.unwrap()))
-            .unwrap()
+        let cache = Arc::new(Cache::new(&CacheCfg::default(), Duration::from_millis(250)).await.unwrap());
+        Scheduler::start(specs, cache, crate::knobs::Knobs::default().admission_headroom).unwrap()
     }
 
     fn secs(n: u64) -> Instant {
@@ -748,6 +753,42 @@ mod tests {
         let r = s.run_jobs((3..8).map(|n| job(n, 0, 4)).collect(), Instant::now() + Duration::from_millis(300)).await;
         assert_eq!(r.unwrap_err(), SchedError::Overloaded);
         assert!(started.elapsed() < Duration::from_millis(50), "shed at admission, not at the deadline");
+        busy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admission_headroom_sheds_before_the_full_deadline() {
+        let fake = Fake { delay: Duration::from_millis(100), ..Fake::default() };
+        let s = sched(vec![spec("m", &fake, 64, 1, 8192)]).await;
+        s.run_jobs(vec![job(1, 0, 4)], secs(5)).await.unwrap(); // seeds the estimate: 0.025 s/token
+        let busy = {
+            let s = s.clone();
+            tokio::spawn(async move { s.run_jobs(vec![job(2, 0, 4)], secs(5)).await })
+        };
+        wait_until(|| s.map.lock().unwrap().contains_key(&[2; 32])).await; // 4 tokens ahead: 100 ms
+        let started = Instant::now();
+        // Predicted finish: (4 ahead + 8 own) × 0.025 s = 300 ms. Deadline 350 ms: predicted fits the
+        // full deadline (300 < 350) but not headroom × 350 ms = 280 ms, so the default headroom (0.8)
+        // sheds a request the old "> left" check would have admitted.
+        let r = s.run_jobs(vec![job(3, 0, 8)], Instant::now() + Duration::from_millis(350)).await;
+        assert_eq!(r.unwrap_err(), SchedError::Overloaded);
+        assert!(started.elapsed() < Duration::from_millis(50), "shed at admission, not at the deadline");
+        busy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admission_headroom_admits_within_headroom() {
+        let fake = Fake { delay: Duration::from_millis(100), ..Fake::default() };
+        let s = sched(vec![spec("m", &fake, 64, 1, 8192)]).await;
+        s.run_jobs(vec![job(1, 0, 4)], secs(5)).await.unwrap(); // seeds the estimate: 0.025 s/token
+        let busy = {
+            let s = s.clone();
+            tokio::spawn(async move { s.run_jobs(vec![job(2, 0, 4)], secs(5)).await })
+        };
+        wait_until(|| s.map.lock().unwrap().contains_key(&[2; 32])).await; // 4 tokens ahead: 100 ms
+        // Predicted finish: (4 ahead + 4 own) × 0.025 s = 200 ms, below headroom × 500 ms = 400 ms: admits.
+        let r = s.run_jobs(vec![job(3, 0, 4)], Instant::now() + Duration::from_millis(500)).await;
+        assert!(r.is_ok(), "predicted finish is within headroom of the deadline");
         busy.await.unwrap().unwrap();
     }
 
