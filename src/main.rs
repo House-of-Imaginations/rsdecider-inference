@@ -29,7 +29,8 @@ enum Cmd {
         #[arg(long)]
         fake_delay_ms: Option<u64>,
         /// Download missing or broken model folders from their `download` URL without asking.
-        #[arg(long, env = "RSDECIDER_DOWNLOAD_MODELS")]
+        #[arg(long, env = "RSDECIDER_DOWNLOAD_MODELS", action = clap::ArgAction::SetTrue,
+              value_parser = clap::builder::BoolishValueParser::new())]
         download_models: bool,
     },
     /// Print the SHA-256 of an API key for the [[keys]] table.
@@ -139,13 +140,20 @@ fn ensure_models(cfg: &Config, download_flag: bool) -> Result<(), String> {
             continue;
         }
         let url = m.download.as_deref().unwrap_or_default();
+        let with_hint = |e: String| format!("model {:?}: {e}; or {}", m.name, download::export_hint(m));
+        let what = match &status {
+            download::Status::Bad { corrupt, .. } if corrupt.is_empty() => "not found".to_string(),
+            s => format!("not usable ({s})"),
+        };
         match download::decide(m, &status, download_flag, interactive) {
             Action::Fail(e) => return Err(e),
-            Action::Pull => block_on(async { Remote::fetch(url).await?.pull(&m.name, &m.path).await })?,
+            Action::Pull => {
+                block_on(async { Remote::fetch(url).await?.pull(&m.name, &m.path).await }).map_err(with_hint)?
+            }
             Action::Prompt => block_on(async {
-                let remote = Remote::fetch(url).await?;
+                let remote = Remote::fetch(url).await.map_err(with_hint)?;
                 eprint!(
-                    "Model {:?} not found at {}. Download {} MB from {url}? [y/N] ",
+                    "Model {:?} {what} at {}. Download {} MB from {url}? [y/N] ",
                     m.name,
                     m.path.display(),
                     remote.total_bytes() >> 20
@@ -155,7 +163,7 @@ fn ensure_models(cfg: &Config, download_flag: bool) -> Result<(), String> {
                 if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
                     return Err(format!("model {:?}: download declined; {}", m.name, download::export_hint(m)));
                 }
-                remote.pull(&m.name, &m.path).await
+                remote.pull(&m.name, &m.path).await.map_err(with_hint)
             })?,
         }
     }
@@ -265,4 +273,28 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let term = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = term => {} }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_models_env_accepts_boolish_values() {
+        let flag = |v: Option<&str>| {
+            // SAFETY: the only test in this binary; nothing else reads or writes the environment concurrently.
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var("RSDECIDER_DOWNLOAD_MODELS", v),
+                    None => std::env::remove_var("RSDECIDER_DOWNLOAD_MODELS"),
+                }
+            }
+            match Cli::try_parse_from(["rsdecider", "serve"]).unwrap().cmd {
+                Cmd::Serve { download_models, .. } => download_models,
+                _ => unreachable!(),
+            }
+        };
+        assert!(flag(Some("1")) && flag(Some("true")) && flag(Some("yes")));
+        assert!(!flag(Some("0")) && !flag(Some("false")) && !flag(None));
+    }
 }

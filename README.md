@@ -135,7 +135,8 @@ without asking; otherwise it exits with the export command. Folders exported bef
 
 > [!NOTE]
 > The shipped configs leave `download` commented out: exports aren't published yet. Point it at wherever you host
-> an exported folder (any HTTP(S) server, e.g. a Hugging Face `resolve/<revision>/english` path).
+> an exported folder (any HTTP(S) server, e.g. a Hugging Face `resolve/<revision>/english` path). Pin `<revision>` to a
+> commit SHA: the hashes come from the same host, so the manifest catches transport errors, not a compromised host.
 
 ## Endpoints
 
@@ -360,7 +361,7 @@ curl localhost:3000/readyz
 ```
 
 `models-export` is opt-in (`profiles: ["export"]`): it installs `tools/requirements.txt` in a Python container and
-exports english and multilingual only where `model.onnx` is missing (Hugging Face cache in the `hf-cache` volume).
+exports english and multilingual only where `manifest.json` (written last) is missing (Hugging Face cache in the `hf-cache` volume).
 rsdecider runs with `--download-models`, so once `download` URLs are set in `rsdecider.toml` it fetches missing models
 on start instead. Compose mounts `../models` writable at `/models` and `self-hosted/rsdecider.toml` at `/etc/rsdecider/rsdecider.toml`;
 edit that file (keys, threads, `max_pending`) and restart. Metrics are published on `127.0.0.1:9000` only.

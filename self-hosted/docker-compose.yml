@@ -34,7 +34,7 @@ services:
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
-  # Opt-in: docker compose --profile export up models-export. Exports only the models whose model.onnx is missing.
+  # Opt-in: docker compose --profile export up models-export. Exports only the models without a manifest.json (written last).
   models-export:
     image: python:3.11-slim
     profiles: ["export"]
@@ -49,8 +49,8 @@ services:
       - |
         set -e
         need=""
-        [ -f /models/english/model.onnx ] || need="$$need english"
-        [ -f /models/multilingual/model.onnx ] || need="$$need multilingual"
+        [ -f /models/english/manifest.json ] || need="$$need english"
+        [ -f /models/multilingual/manifest.json ] || need="$$need multilingual"
         if [ -z "$$need" ]; then echo "models present, nothing to export"; exit 0; fi
         pip install --no-cache-dir -q --extra-index-url https://download.pytorch.org/whl/cpu -r tools/requirements.txt
         for m in $$need; do

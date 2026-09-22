@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 
 /// Files a pre-manifest export folder must have to load.
 const LEGACY: [&str; 3] = ["model.onnx", "tokenizer.json", "laya.json"];
+/// The only names a manifest may list (they become paths inside the model folder).
+const KNOWN: [&str; 6] = ["model.onnx", "tokenizer.json", "laya.json", "fixtures.json", "mlx.safetensors", "mlx.json"];
+/// Remote manifest.json read cap.
+const MAX_MANIFEST: usize = 1 << 20;
 
 #[derive(Debug, Deserialize)]
 pub struct Manifest {
@@ -60,11 +64,12 @@ impl fmt::Display for Status {
 
 fn parse_manifest(raw: &[u8]) -> Result<Manifest, String> {
     let m: Manifest = serde_json::from_slice(raw).map_err(|e| format!("manifest.json: {e}"))?;
-    // Names become paths inside the model folder: plain file names only.
-    for name in m.files.keys() {
-        if name == "manifest.json" || Path::new(name).file_name().and_then(|n| n.to_str()) != Some(name.as_str()) {
-            return Err(format!("manifest.json: bad file name {name:?}"));
-        }
+    if let Some(name) = m.files.keys().find(|n| !KNOWN.contains(&n.as_str())) {
+        return Err(format!("manifest.json: unexpected file name {name:?}"));
+    }
+    let has = |n: &str| m.files.contains_key(n);
+    if !(has("tokenizer.json") && has("laya.json") && (has("model.onnx") || has("mlx.safetensors"))) {
+        return Err("manifest.json: must list tokenizer.json, laya.json and model.onnx or mlx.safetensors".into());
     }
     Ok(m)
 }
@@ -80,11 +85,17 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
     }
 }
 
-/// `None` = fine, `Some(true)` = missing, `Some(false)` = wrong size (or sha256 when `full`; hashing GBs takes seconds).
-fn problem(path: &Path, e: &Entry, full: bool) -> Option<bool> {
-    let Ok(md) = std::fs::metadata(path) else { return Some(true) };
+#[derive(PartialEq)]
+enum Fault {
+    Missing,
+    Corrupt,
+}
+
+/// `None` = fine. Corrupt = wrong size, or wrong sha256 when `full` (hashing GBs takes seconds).
+fn fault(path: &Path, e: &Entry, full: bool) -> Option<Fault> {
+    let Ok(md) = std::fs::metadata(path) else { return Some(Fault::Missing) };
     let ok = md.len() == e.size && (!full || sha256_file(path).is_ok_and(|h| h.eq_ignore_ascii_case(&e.sha256)));
-    (!ok).then_some(false)
+    (!ok).then_some(Fault::Corrupt)
 }
 
 /// Checks a model folder against its manifest.json. `full` hashes every file; otherwise sizes only.
@@ -105,9 +116,9 @@ pub fn check(dir: &Path, full: bool) -> Status {
     };
     let (mut missing, mut corrupt) = (vec![], vec![]);
     for (name, e) in &m.files {
-        match problem(&dir.join(name), e, full) {
-            Some(true) => missing.push(name.clone()),
-            Some(false) => corrupt.push(name.clone()),
+        match fault(&dir.join(name), e, full) {
+            Some(Fault::Missing) => missing.push(name.clone()),
+            Some(Fault::Corrupt) => corrupt.push(name.clone()),
             None => {}
         }
     }
@@ -160,13 +171,20 @@ impl Remote {
             .map_err(|e| e.to_string())?;
         let base = base.trim_end_matches('/').to_string();
         let url = format!("{base}/manifest.json");
-        let raw = get(&client, &url).await?.bytes().await.map_err(|e| format!("{url}: {e}"))?.to_vec();
+        let mut resp = get(&client, &url).await?;
+        let mut raw = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| format!("{url}: {e}"))? {
+            if raw.len() + chunk.len() > MAX_MANIFEST {
+                return Err(format!("{url}: larger than {MAX_MANIFEST} bytes"));
+            }
+            raw.extend_from_slice(&chunk);
+        }
         let manifest = parse_manifest(&raw).map_err(|e| format!("{url}: {e}"))?;
         Ok(Self { base, client, raw, manifest })
     }
 
     pub fn total_bytes(&self) -> u64 {
-        self.manifest.files.values().map(|e| e.size).sum()
+        self.manifest.files.values().fold(0u64, |a, e| a.saturating_add(e.size))
     }
 
     /// Downloads every file that is missing or fails size+sha256, then writes manifest.json last.
@@ -174,7 +192,7 @@ impl Remote {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         for (name, e) in &self.manifest.files {
             let dest = dir.join(name);
-            if problem(&dest, e, true).is_none() {
+            if fault(&dest, e, true).is_none() {
                 continue;
             }
             self.download(label, name, e, &dest).await?;
@@ -197,6 +215,9 @@ impl Remote {
             let (mut h, mut done) = (Sha256::new(), 0u64);
             let (mut last_pct, mut last_at) = (0, Instant::now());
             while let Some(chunk) = resp.chunk().await.map_err(|x| format!("{url}: {x}"))? {
+                if done + chunk.len() as u64 > e.size {
+                    return Err(format!("{name}: server sent more than the manifest's {} bytes", e.size));
+                }
                 h.update(&chunk);
                 f.write_all(&chunk).map_err(|x| format!("{}: {x}", part.display()))?;
                 done += chunk.len() as u64;
@@ -240,7 +261,23 @@ mod tests {
     use axum::Router;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    fn tmp() -> PathBuf {
+    /// Temp dir removed on drop.
+    struct Tmp(PathBuf);
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for Tmp {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    fn tmp() -> Tmp {
         static N: AtomicU32 = AtomicU32::new(0);
         let d = std::env::temp_dir().join(format!(
             "rsdecider-dl-{}-{}",
@@ -249,7 +286,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        d
+        Tmp(d)
     }
 
     fn manifest_for(files: &[(&str, &[u8])]) -> String {
@@ -286,7 +323,8 @@ mod tests {
     #[tokio::test]
     async fn pull_downloads_and_verifies() {
         let url = serve(&FILES, &FILES).await;
-        let dir = tmp().join("english");
+        let root = tmp();
+        let dir = root.join("english");
         Remote::fetch(&url).await.unwrap().pull("english", &dir).await.unwrap();
         assert_eq!(check(&dir, true), Status::Ok);
         assert_eq!(std::fs::read(dir.join("model.onnx")).unwrap(), FILES[0].1);
@@ -301,6 +339,27 @@ mod tests {
         assert!(err.contains("model.onnx"), "{err}");
         assert!(!dir.join("model.onnx").exists() && !dir.join("model.onnx.part").exists());
         assert!(!dir.join("manifest.json").exists());
+    }
+
+    #[tokio::test]
+    async fn pull_stops_when_server_sends_more_than_manifest() {
+        let served = [("model.onnx", &b"weights weights weights and then some more"[..]), FILES[1], FILES[2]];
+        let url = serve(&served, &FILES).await;
+        let dir = tmp();
+        let err = Remote::fetch(&url).await.unwrap().pull("english", &dir).await.unwrap_err();
+        assert!(err.contains("model.onnx") && err.contains("more than"), "{err}");
+        assert!(!dir.join("model.onnx").exists() && !dir.join("model.onnx.part").exists());
+    }
+
+    #[tokio::test]
+    async fn pull_keeps_good_files_and_replaces_corrupt_ones() {
+        // laya.json is not served at all: pull only succeeds if it keeps the good local copy.
+        let url = serve(&FILES[..2], &FILES).await;
+        let dir = tmp();
+        write(&dir, &[FILES[2], ("tokenizer.json", b"{\"tok\":2}")]);
+        Remote::fetch(&url).await.unwrap().pull("english", &dir).await.unwrap();
+        assert_eq!(std::fs::read(dir.join("tokenizer.json")).unwrap(), FILES[1].1);
+        assert_eq!(check(&dir, true), Status::Ok);
     }
 
     #[test]
@@ -328,8 +387,17 @@ mod tests {
     }
 
     #[test]
-    fn manifest_rejects_path_traversal() {
-        assert!(parse_manifest(br#"{"files": {"../x": {"size": 1, "sha256": "00"}}}"#).is_err());
+    fn manifest_allows_only_known_names() {
+        let with = |extra: &str| {
+            let entry = format!("{{\"files\": {{\"{extra}\": {{\"size\": 1, \"sha256\": \"00\"}}, ");
+            parse_manifest(manifest_for(&FILES).replacen("{\"files\": {", &entry, 1).as_bytes())
+        };
+        assert!(with("mlx.json").is_ok());
+        for bad in ["../x", "/x", "a/b", "", "evil.sh", "manifest.json"] {
+            assert!(with(bad).is_err(), "{bad:?} accepted");
+        }
+        assert!(parse_manifest(manifest_for(&FILES[..2]).as_bytes()).is_err(), "laya.json is required");
+        assert!(parse_manifest(manifest_for(&FILES[1..]).as_bytes()).is_err(), "a model file is required");
     }
 
     fn model(download: Option<&str>) -> ModelCfg {

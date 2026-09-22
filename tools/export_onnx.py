@@ -175,6 +175,9 @@ def main():
     if args.force and args.quantize is None:
         ap.error("--force only makes sense with --quantize")
     os.makedirs(args.out, exist_ok=True)
+    manifest = os.path.join(args.out, "manifest.json")
+    if os.path.exists(manifest):  # never leave an old manifest beside a half-written new export
+        os.remove(manifest)
     torch.backends.mha.set_fastpath_enabled(False)  # fused MHA kernels are not exportable
 
     agent = laya.load(args.repo, device="cpu", subfolder=args.subfolder)
