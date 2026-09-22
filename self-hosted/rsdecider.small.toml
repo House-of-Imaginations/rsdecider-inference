@@ -1,4 +1,6 @@
-# 2-4 vCPU / 4 GB minimum (fp32 models; see README > Small machines for the RAM floor and why int8 isn't used).
+# 2-4 vCPU / 4 GB minimum (fp32 models; see README > Small machines for the RAM floor). w8 (8-bit weight-only)
+# is an opt-in trade-off, not the default here: `--quantize w8 --force` today (English fails the decision gate
+# on an ambiguous near-tie input, see README), ~3x less memory, |Δp| up to ~0.07 on ambiguous questions.
 # Same mount layout as self-hosted/rsdecider.toml. ort_global_threads = 2 works for 2-4 vCPU boxes; the startup
 # thread-budget warning is expected on this profile (it counts the worst case: both models running at once, plus
 # the mostly idle HTTP and tokenize threads).

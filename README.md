@@ -276,8 +276,8 @@ first, then set the queues from the throughput you measure (the `rsdecider_*` me
   items (EMA seconds/token × (tokens already queued + this request's own) ÷ workers), and returns `529` up front when
   the work can't finish by the deadline.
 - **Biggest lever:** cold capacity is inference-bound, so the model beats any server knob — a GPU
-  (`cargo build --release --features cuda`, `execution_provider = "cuda"`) today; int8 (`tools/export_onnx.py
-  --quantize int8`) once an export passes the decision gate (see Small machines below).
+  (`cargo build --release --features cuda`, `execution_provider = "cuda"`) today; a w8 export is a memory/latency
+  trade-off, not a free win (see Small machines below).
 
 **Advanced `[knobs]`** ([`src/knobs.rs`](./src/knobs.rs)): rarely needed, but tunable without a rebuild.
 
@@ -304,10 +304,25 @@ in normal operation. Copy it and mount your models.
 host, and plan closer to 4 GB just for the models. With 2 GB, load only one model (drop the `[[models]]` table you
 don't need and point `[routing]` at the one you keep).
 
-**int8:** `tools/export_onnx.py --quantize int8` exists and now refuses to write a model whose decisions differ from
-the fp32 one. Today's models fail that check — dynamic int8 gets top-1 agreement of 12/18 (English) and 14/19
-(multilingual) against fp32 on the fixture questions — so int8 is not recommended right now. Calibrated static int8,
-fp16 and quantization-aware training are future options that might pass the gate.
+**w8 (opt-in, not the default):** `tools/export_onnx.py --quantize w8` runs 8-bit weight-only quantization (ORT
+`MatMulNBitsQuantizer`, block_size=128, symmetric, accuracy_level=4) behind the same decision gate as int8 (below).
+On an M1 Pro, w8 cuts single-batch English inference 267 → 170 ms p50 and peak server RSS 3.0 → 1.05 GB; files shrink
+1,608 → 564 MB (English) and 1,229 → 874 MB (multilingual) — roughly 3x less memory; x86 not measured yet. It is not
+the shipped default because the gate is a real check, not a formality: on the fixture set English currently **fails**
+it — `max |Δp| 0.0731` on an ambiguous three-way severity call ("ok" vs "warning" near a tie) — while multilingual
+passes. Use it anyway with `--quantize w8 --force`, which still writes the quantized model after printing the gate
+numbers and a warning; `self-hosted/rsdecider.small.toml` stays pointed at the fp32 paths.
+
+**int8:** `tools/export_onnx.py --quantize int8` (dynamic per-tensor quantization) exists and uses the same decision
+gate. Today's models fail it — dynamic int8 gets top-1 agreement of 12/18 (English) and 14/19 (multilingual) against
+fp32 on the fixture questions — so int8 is not recommended. Calibrated static int8, fp16 and quantization-aware
+training are future options that might pass the gate.
+
+**Decision gate** (`tools/export_onnx.py`, both `int8` and `w8`): a quantized export only replaces `model.onnx` if,
+against the fp32 reference on every fixture question, `|Δp| <= 0.05` and `|Δ act_prob| <= 0.05`, and top-1 matches on
+every *decisive* question — one where the fp32 top-2 probability margin is `> 0.10` (or there's only one option).
+With `|Δp| <= 0.05` per option, a flip is only possible when the margin is `<= 0.10`, so a flip there is a tie broken
+differently, not damage. `--force` bypasses a failed gate for a single export run; it never changes the thresholds.
 
 ## Self-hosted (Docker)
 
@@ -371,7 +386,8 @@ Measured with k6 against the real fp32 models on an Apple M1 Pro (10 cores), CPU
 | 90k-char states, 40–200 req/s | model queue sheds the excess as `529`, peak RSS 2.2 GB, 0.4–0.5% of accepted requests `504` |
 
 Cold capacity is inference-bound (~10 questions/s English, ~4/s multilingual). The biggest lever is the model, not the
-server: a GPU/CoreML execution provider, or an int8 export once one passes the decision gate. Full numbers:
+server: a GPU/CoreML execution provider, or an opt-in w8 export once you accept its trade-off (see Small machines
+above). Full numbers:
 [`stress/results/2026-09-21-m1pro.md`](./stress/results/2026-09-21-m1pro.md). Re-run with `stress/run.sh` against a
 running server (`-e RATE=…` per scenario; see the script).
 
