@@ -79,6 +79,8 @@ pub struct ModelCfg {
     pub max_batch_tokens: usize,
     #[serde(default = "d_wait")]
     pub max_wait_ms: u64,
+    /// Base URL the model folder is fetched from (`<download>/manifest.json`, ...); see `rsdecider models pull`.
+    pub download: Option<String>,
 }
 
 fn d_ep() -> String {
@@ -160,6 +162,11 @@ impl Config {
             }
             if m.workers == 0 || m.max_batch_items == 0 || m.intra_op_threads == 0 {
                 return Err(format!("model {:?}: workers, max_batch_items and intra_op_threads must be >= 1", m.name));
+            }
+            if let Some(u) = &m.download
+                && !(u.starts_with("https://") || u.starts_with("http://"))
+            {
+                return Err(format!("model {:?}: download must start with https:// or http://", m.name));
             }
             let need = self.limits.max_batch_states * self.limits.max_questions_per_state;
             if need > m.max_pending {
@@ -274,6 +281,16 @@ burst = 40
     fn rejects_unadmittable_request_size() {
         let s = BASE.replace("path = \"models/english\"", "path = \"models/english\"\nmax_pending = 100");
         assert!(Config::from_toml_str(&s).unwrap_err().contains("max_pending"));
+    }
+
+    #[test]
+    fn download_must_be_http() {
+        let with = |u: &str| {
+            BASE.replace("path = \"models/english\"", &format!("path = \"models/english\"\ndownload = \"{u}\""))
+        };
+        assert!(Config::from_toml_str(&with("ftp://x/english")).unwrap_err().contains("download"));
+        let c = Config::from_toml_str(&with("http://127.0.0.1:8765/english")).unwrap();
+        assert_eq!(c.models[0].download.as_deref(), Some("http://127.0.0.1:8765/english"));
     }
 
     #[test]

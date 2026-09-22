@@ -1,11 +1,13 @@
 use clap::{Parser, Subcommand};
 use rsdecider::config::{Config, ModelCfg};
+use rsdecider::download::{self, Action, Remote};
 use rsdecider::fake::Fake;
 use rsdecider::model::LoadedModel;
 use rsdecider::model::session::OrtBackend;
 use rsdecider::scheduler::{Backend, BackendFactory};
 use rsdecider::{api, auth, metrics};
 use std::future::IntoFuture;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,9 +28,34 @@ enum Cmd {
         /// Use the deterministic fake backend with this per-batch latency (stress-testing server overhead).
         #[arg(long)]
         fake_delay_ms: Option<u64>,
+        /// Download missing or broken model folders from their `download` URL without asking.
+        #[arg(long, env = "RSDECIDER_DOWNLOAD_MODELS")]
+        download_models: bool,
     },
     /// Print the SHA-256 of an API key for the [[keys]] table.
     HashKey { key: String },
+    /// Verify or download model folders.
+    Models {
+        #[command(subcommand)]
+        cmd: ModelsCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelsCmd {
+    /// Check every model folder against its manifest.json (sizes and SHA-256).
+    Check {
+        #[arg(long, default_value = "rsdecider.toml")]
+        config: PathBuf,
+    },
+    /// Download model folders that fail the check from their `download` URL.
+    Pull {
+        #[arg(long, default_value = "rsdecider.toml")]
+        config: PathBuf,
+        /// Only this model.
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 fn main() -> Result<(), String> {
@@ -37,8 +64,47 @@ fn main() -> Result<(), String> {
             println!("{}", auth::hash_key(&key));
             Ok(())
         }
-        Cmd::Serve { config, fake_delay_ms } => {
+        Cmd::Models { cmd: ModelsCmd::Check { config } } => {
             let cfg = Config::load(&config)?;
+            let mut bad = 0;
+            for m in &cfg.models {
+                let s = download::check(&m.path, true);
+                println!("{}: {s}", m.name);
+                bad += usize::from(!s.usable());
+            }
+            if bad > 0 { Err(format!("{bad} model folder(s) failed the check")) } else { Ok(()) }
+        }
+        Cmd::Models { cmd: ModelsCmd::Pull { config, model } } => {
+            let cfg = Config::load(&config)?;
+            if let Some(n) = &model
+                && !cfg.models.iter().any(|m| &m.name == n)
+            {
+                return Err(format!("no model named {n:?} in {}", config.display()));
+            }
+            block_on(async {
+                for m in cfg.models.iter().filter(|m| model.as_ref().is_none_or(|n| n == &m.name)) {
+                    let s = download::check(&m.path, true);
+                    if s.usable() {
+                        println!("{}: {s}", m.name);
+                        continue;
+                    }
+                    let Some(url) = &m.download else {
+                        return Err(format!(
+                            "model {:?} at {}: {s}; no `download` URL configured, {}",
+                            m.name,
+                            m.path.display(),
+                            download::export_hint(m)
+                        ));
+                    };
+                    Remote::fetch(url).await?.pull(&m.name, &m.path).await?;
+                    println!("{}: {}", m.name, download::check(&m.path, true));
+                }
+                Ok(())
+            })
+        }
+        Cmd::Serve { config, fake_delay_ms, download_models } => {
+            let cfg = Config::load(&config)?;
+            ensure_models(&cfg, download_models)?;
             // Must run before any Session is built, so every model picks up the shared pool.
             if let Some(n) = cfg.knobs.ort_global_threads {
                 let pool = ort::environment::GlobalThreadPoolOptions::default()
@@ -57,6 +123,43 @@ fn main() -> Result<(), String> {
                 .block_on(serve(cfg, config, fake_delay_ms))
         }
     }
+}
+
+/// Downloads run on this throwaway runtime, before the server's runtime exists.
+fn block_on<T>(f: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?.block_on(f)
+}
+
+/// Cheap (size-only) check of every model folder; pulls, asks, or fails per `download::decide`.
+fn ensure_models(cfg: &Config, download_flag: bool) -> Result<(), String> {
+    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    for m in &cfg.models {
+        let status = download::check(&m.path, false);
+        if status.usable() {
+            continue;
+        }
+        let url = m.download.as_deref().unwrap_or_default();
+        match download::decide(m, &status, download_flag, interactive) {
+            Action::Fail(e) => return Err(e),
+            Action::Pull => block_on(async { Remote::fetch(url).await?.pull(&m.name, &m.path).await })?,
+            Action::Prompt => block_on(async {
+                let remote = Remote::fetch(url).await?;
+                eprint!(
+                    "Model {:?} not found at {}. Download {} MB from {url}? [y/N] ",
+                    m.name,
+                    m.path.display(),
+                    remote.total_bytes() >> 20
+                );
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer).map_err(|e| e.to_string())?;
+                if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    return Err(format!("model {:?}: download declined; {}", m.name, download::export_hint(m)));
+                }
+                remote.pull(&m.name, &m.path).await
+            })?,
+        }
+    }
+    Ok(())
 }
 
 fn ort_factory(m: &ModelCfg, _lm: &LoadedModel, global_pool: bool) -> BackendFactory {
