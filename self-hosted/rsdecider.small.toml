@@ -1,4 +1,8 @@
-# 2-4 vCPU / 4 GB minimum (fp32 models; see README > Small machines for the RAM floor and why int8 isn't used).
+# 2-4 vCPU / 4 GB minimum; model paths point at w8 (8-bit weight-only) exports — smaller files and lower peak RSS
+# than fp32, see README > Small machines for measured numbers. Export with:
+#   python tools/export_onnx.py --out models/english-w8 --quantize w8
+#   python tools/export_onnx.py --subfolder multilingual --out models/multilingual-w8 --quantize w8
+# No w8 export yet? Point path at /models/english or /models/multilingual (fp32) instead.
 # Same mount layout as self-hosted/rsdecider.toml. ort_global_threads = 2 works for 2-4 vCPU boxes; the startup
 # thread-budget warning is expected on this profile (it counts the worst case: both models running at once, plus
 # the mostly idle HTTP and tokenize threads).
@@ -18,7 +22,7 @@ non_english_model = "multilingual"
 
 [[models]]
 name = "english"
-path = "/models/english"
+path = "/models/english-w8"
 workers = 1
 max_pending = 32
 max_batch_items = 4
@@ -26,7 +30,7 @@ max_batch_tokens = 2048
 
 [[models]]
 name = "multilingual"
-path = "/models/multilingual"
+path = "/models/multilingual-w8"
 workers = 1
 max_pending = 32
 max_batch_items = 4
