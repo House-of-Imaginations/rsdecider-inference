@@ -7,3 +7,4 @@ onnx_ir  # onnxruntime.quantization.matmul_nbits_quantizer (--quantize w8) impor
 huggingface_hub
 safetensors
 numpy
+mlx; sys_platform == "darwin" and platform_machine == "arm64"

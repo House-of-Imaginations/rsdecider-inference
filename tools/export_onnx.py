@@ -69,6 +69,37 @@ def temperature(t_by_type, t_by_options, qtype, k):
     return max(t_by_options.get(temp_bucket(qtype, k), t_by_type[qtype]), 1e-3)
 
 
+def update_gate(stats, p_cmp, p_ref, act_cmp, act_ref):
+    """Near-tie-aware decision gate, shared by the quantized-ONNX and MLX gates. Decisive = single option
+    (trivially agrees), or reference top-2 margin > 0.10. With |Δp| <= 0.05 per option, only a question whose
+    margin <= 0.10 can flip top-1, so a flip on a near-tie is a tie broken differently, not accuracy damage;
+    only decisive questions gate the export."""
+    top1_cmp, top1_ref = int(np.argmax(p_cmp)), int(np.argmax(p_ref))
+    if len(p_ref) == 1:
+        decisive = True
+    else:
+        p_ref_sorted = np.sort(p_ref)[::-1]
+        decisive = float(p_ref_sorted[0] - p_ref_sorted[1]) > 0.10
+        if not decisive:
+            stats["near_ties"] += 1
+            stats["near_ties_flipped"] += int(top1_cmp != top1_ref)
+    if decisive:
+        stats["n_decisive"] += 1
+        stats["agree_decisive"] += int(top1_cmp == top1_ref)
+    stats["max_dp"] = max(stats["max_dp"], float(np.abs(p_cmp - p_ref).max()))
+    stats["max_dact"] = max(stats["max_dact"], abs(act_cmp - act_ref))
+
+
+def gate_failed(stats):
+    return stats["agree_decisive"] < stats["n_decisive"] or stats["max_dp"] > 0.05 or stats["max_dact"] > 0.05
+
+
+def gate_line(stats):
+    return (f"top-1 agreement on decisive questions {stats['agree_decisive']}/{stats['n_decisive']}; "
+            f"near-ties {stats['near_ties']} ({stats['near_ties_flipped']} flipped); "
+            f"max |Δp| {stats['max_dp']:.4f} (temperature-scaled); max |Δ act_prob| {stats['max_dact']:.4f}")
+
+
 def encode(agent, state, qdef):
     q = agent._to_internal(qdef)
     cfg = agent.cfg
@@ -149,10 +180,193 @@ def generated_cases():
     ]
 
 
+def resolve_checkpoint_dir(repo, subfolder):
+    """The local HF snapshot dir laya.load() reads from (mirrors laya.agent.Agent.__init__)."""
+    model_dir = repo
+    if not os.path.exists(model_dir):
+        from huggingface_hub import snapshot_download
+        kw = {"token": os.environ.get("HF_TOKEN")}
+        if subfolder:
+            kw["allow_patterns"] = [f"{subfolder}/*"]
+        model_dir = snapshot_download(repo, **kw)
+    return os.path.join(model_dir, subfolder) if subfolder else model_dir
+
+
+def mlx_export_and_gate(agent, checkpoint_dir, out, fixtures, force):
+    """Write mlx.safetensors + mlx.json (Rust-layout weights, fp16 except the fp32 act head) and gate them
+    against the PyTorch logits/act_prob already computed for `fixtures`. On a failing gate, no mlx.* files
+    are kept unless `force`."""
+    try:
+        import mlx.core as mx
+        import mlx.nn as nn
+    except ImportError:
+        raise SystemExit("--mlx needs Apple Silicon and `pip install mlx`")
+
+    def ln(d, bias):
+        return nn.LayerNorm(d, eps=1e-5, bias=bias)
+
+    class EncLayer(nn.Module):
+        def __init__(self, i, mc):
+            super().__init__()
+            D, self.H, I = mc["hidden_size"], mc["num_attention_heads"], mc["intermediate_size"]
+            self.is_global = i % mc["global_attn_every_n_layers"] == 0
+            self.attn_norm = ln(D, False) if i else None
+            self.Wqkv = nn.Linear(D, 3 * D, bias=False)
+            self.Wo = nn.Linear(D, D, bias=False)
+            theta = mc["rope_theta_global"] if self.is_global else mc["rope_theta_local"]
+            self.rope = nn.RoPE(D // self.H, base=theta)
+            self.mlp_norm = ln(D, False)
+            self.Wi = nn.Linear(D, 2 * I, bias=False)
+            self.Wo2 = nn.Linear(I, D, bias=False)
+
+        def __call__(self, x, gmask, lmask):
+            B, L, D = x.shape
+            h = self.attn_norm(x) if self.attn_norm is not None else x
+            q, k, v = self.Wqkv(h).reshape(B, L, 3, self.H, D // self.H).transpose(2, 0, 3, 1, 4)
+            o = mx.fast.scaled_dot_product_attention(self.rope(q), self.rope(k), v, scale=(D // self.H) ** -0.5,
+                                                       mask=gmask if self.is_global else lmask)
+            x = x + self.Wo(o.transpose(0, 2, 1, 3).reshape(B, L, D))
+            a, g = mx.split(self.Wi(self.mlp_norm(x)), 2, axis=-1)
+            return x + self.Wo2(nn.gelu(a) * g)
+
+    class HeadLayer(nn.Module):  # nn.TransformerEncoderLayer(norm_first=True, activation=relu)
+        def __init__(self, D, hd):
+            super().__init__()
+            self.hd = hd
+            self.norm1, self.norm2 = ln(D, True), ln(D, True)
+            self.in_proj = nn.Linear(D, 3 * D)
+            self.out_proj = nn.Linear(D, D)
+            self.linear1, self.linear2 = nn.Linear(D, 4 * D), nn.Linear(4 * D, D)
+
+        def __call__(self, x, kmask):
+            B, L, D = x.shape
+            hh = D // self.hd
+            q, k, v = self.in_proj(self.norm1(x)).reshape(B, L, 3, hh, self.hd).transpose(2, 0, 3, 1, 4)
+            o = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.hd ** -0.5, mask=kmask)
+            x = x + self.out_proj(o.transpose(0, 2, 1, 3).reshape(B, L, D))
+            return x + self.linear2(nn.relu(self.linear1(self.norm2(x))))
+
+    class Laya(nn.Module):
+        def __init__(self, mc):
+            super().__init__()
+            D = mc["hidden_size"]
+            self.mask_value, self.local_attention = mc["mask_value"], mc["local_attention"]
+            self.tok = nn.Embedding(mc["vocab_size"], D)
+            self.emb_norm = ln(D, False)
+            self.layers = [EncLayer(i, mc) for i in range(mc["num_hidden_layers"])]
+            self.final_norm = ln(D, False)
+            self.type_emb = nn.Embedding(3, D)
+            self.head = [HeadLayer(D, mc["head_dim_head"]) for _ in range(mc["head_layers"])]
+            self.sc_norm = ln(D, True)
+            self.sc1, self.sc2 = nn.Linear(D, D), nn.Linear(D, 1)
+            self.act1, self.act2 = nn.Linear(D + 4, 256), nn.Linear(256, 2)
+
+        def __call__(self, ids, am, qtype, mpos, mmask):
+            B, L = ids.shape
+            dt = self.tok.weight.dtype
+            key = mx.where(am[:, None, None, :] == 1, 0.0, self.mask_value)
+            pos = mx.arange(L)
+            win = mx.abs(pos[:, None] - pos[None, :]) <= self.local_attention // 2
+            gmask = key.astype(dt)
+            lmask = mx.where(win[None, None], key, self.mask_value).astype(dt)
+            x = self.emb_norm(self.tok(ids))
+            for layer in self.layers:
+                x = layer(x, gmask, lmask)
+            x = self.final_norm(x) + self.type_emb(qtype)[:, None, :]
+            for layer in self.head:
+                x = layer(x, gmask)
+            m = mx.take_along_axis(x, mx.maximum(mpos, 0)[:, :, None], axis=1)
+            logits = self.sc2(nn.gelu(self.sc1(self.sc_norm(m)))).squeeze(-1).astype(mx.float32)
+            logits = mx.where(mmask == 1, logits, -1e4)
+            p = mx.softmax(logits, -1)
+            kk = mx.maximum(mmask.sum(-1), 2).astype(mx.float32)
+            ent = -(p * mx.log(mx.maximum(p, 1e-9))).sum(-1) / mx.log(kk)
+            top2 = mx.topk(p, 2, axis=-1)  # ascending order in mlx
+            t0, t1 = top2.max(-1), top2.min(-1)
+            feats = mx.stack([t0, t0 - t1, ent, kk / 255.0], -1)
+            act = self.act2(nn.gelu(self.act1(mx.concatenate([x[:, 0].astype(mx.float32), feats], -1))))
+            return logits, mx.softmax(act, -1)[:, 0]
+
+    # rename map from the reference port (.superpowers/sdd/2026-09-22-mlx-backend/ref/mlx_laya.py)
+    ren = {"encoder.embeddings.tok_embeddings": "tok", "encoder.embeddings.norm": "emb_norm",
+           "encoder.final_norm": "final_norm", "scorer.0": "sc_norm", "scorer.1": "sc1", "scorer.3": "sc2",
+           "act_head.0": "act1", "act_head.2": "act2", "type_emb": "type_emb"}
+    raw = mx.load(os.path.join(checkpoint_dir, "model.safetensors"))
+    weights = {}
+    for k, v in raw.items():
+        if k == "temperature":
+            continue
+        p = k
+        for a, b in ren.items():
+            if k.startswith(a + "."):
+                p = b + k[len(a):]
+        p = (p.replace("encoder.layers.", "layers.").replace("head.layers.", "head.")
+               .replace(".attn.Wqkv", ".Wqkv").replace(".attn.Wo", ".Wo")
+               .replace(".mlp.Wi", ".Wi").replace(".mlp.Wo", ".Wo2")
+               .replace(".self_attn.in_proj_weight", ".in_proj.weight")
+               .replace(".self_attn.in_proj_bias", ".in_proj.bias")
+               .replace(".self_attn.out_proj", ".out_proj"))
+        weights[p] = v.astype(mx.float32 if p.startswith(("act1.", "act2.")) else mx.float16)
+
+    with open(os.path.join(checkpoint_dir, "encoder", "config.json")) as f:
+        ec = json.load(f)
+    rp = ec["rope_parameters"]
+    mc = {"hidden_size": ec["hidden_size"], "num_attention_heads": ec["num_attention_heads"],
+          "num_hidden_layers": ec["num_hidden_layers"], "intermediate_size": ec["intermediate_size"],
+          "global_attn_every_n_layers": ec["global_attn_every_n_layers"], "local_attention": ec["local_attention"],
+          "rope_theta_global": rp["full_attention"]["rope_theta"],
+          "rope_theta_local": rp["sliding_attention"]["rope_theta"], "vocab_size": ec["vocab_size"],
+          "head_layers": 2, "head_dim_head": 64, "mask_value": -30000.0}
+
+    # mx.load() infers the format from the extension, so the weights tmp file must still end in .safetensors
+    st_tmp, json_tmp = os.path.join(out, "mlx.tmp.safetensors"), os.path.join(out, "mlx.json.tmp")
+    st_path, json_path = os.path.join(out, "mlx.safetensors"), os.path.join(out, "mlx.json")
+    try:
+        mx.save_safetensors(st_tmp, weights)
+        with open(json_tmp, "w") as f:
+            json.dump(mc, f, indent=2)
+
+        m = Laya(mc)
+        m.load_weights(st_tmp, strict=True)
+        mx.eval(m.parameters())
+
+        stats = dict(n_decisive=0, agree_decisive=0, near_ties=0, near_ties_flipped=0, max_dp=0.0, max_dact=0.0)
+        for case in fixtures:
+            for qid, enc in case["encoded"].items():
+                qtype, k = QTYPES[case["questions"][qid]["type"]], len(enc["markers"])
+                ids = mx.array(np.array([enc["ids"]], dtype=np.int32))
+                am = mx.array(np.ones((1, len(enc["ids"])), dtype=np.int32))
+                mpos = mx.array(np.array([enc["markers"]], dtype=np.int32))
+                mmask = mx.array(np.ones((1, k), dtype=np.int32))
+                logits, act = m(ids, am, mx.array(np.array([qtype], dtype=np.int32)), mpos, mmask)
+                got, ref = np.array(logits)[0, :k].astype(np.float64), np.array(case["raw"][qid]["logits"])
+                t = temperature(agent.temperature, agent.temperature_by_options, qtype, k)
+                update_gate(stats, softmax(got / t), softmax(ref / t), float(np.array(act)[0]),
+                            case["raw"][qid]["act_prob"])
+        print("mlx " + gate_line(stats))
+
+        if gate_failed(stats) and not force:
+            raise SystemExit("mlx decision gate failed: top-1 must match on every decisive question (reference "
+                              "top-2 margin > 0.10), |Δp| <= 0.05 and |Δ act_prob| <= 0.05 on every question; "
+                              "no mlx.safetensors/mlx.json written (rerun with --force to override)")
+        if gate_failed(stats):
+            print("WARNING: mlx decision gate failed (see numbers above) but --force was given; writing "
+                  "mlx.safetensors/mlx.json anyway")
+        os.replace(st_tmp, st_path)
+        os.replace(json_tmp, json_path)
+    finally:
+        for p in (st_tmp, json_tmp):  # leftover only when the gate failed without --force, or on any error
+            if os.path.exists(p):
+                os.remove(p)
+
+
 def write_manifest(out):
-    """manifest.json: size + sha256 of every served file, so rsdecider can verify (and download) the folder."""
+    """manifest.json: size + sha256 of every served file, so rsdecider can verify (and download) the folder.
+    mlx.safetensors/mlx.json are included when a --mlx export wrote them."""
     files = {}
-    for name in ("model.onnx", "tokenizer.json", "laya.json", "fixtures.json"):
+    names = ["model.onnx", "tokenizer.json", "laya.json", "fixtures.json"]
+    names += [n for n in ("mlx.safetensors", "mlx.json") if os.path.exists(os.path.join(out, n))]
+    for name in names:
         h = hashlib.sha256()
         with open(os.path.join(out, name), "rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):
@@ -168,12 +382,14 @@ def main():
     ap.add_argument("--subfolder", default=None, help="checkpoint subfolder, e.g. multilingual; omit for the repo root")
     ap.add_argument("--out", required=True)
     ap.add_argument("--quantize", choices=["int8", "w8"])
+    ap.add_argument("--mlx", action="store_true",
+                     help="also write mlx.safetensors + mlx.json, gated against PyTorch on the fixtures")
     ap.add_argument("--force", action="store_true",
-                     help="with --quantize, replace model.onnx with the quantized model even if the decision "
-                          "gate fails (prints the gate numbers and a warning first)")
+                     help="with --quantize/--mlx, keep the quantized model.onnx / mlx.* files even if the "
+                          "decision gate fails (prints the gate numbers and a warning first)")
     args = ap.parse_args()
-    if args.force and args.quantize is None:
-        ap.error("--force only makes sense with --quantize")
+    if args.force and args.quantize is None and not args.mlx:
+        ap.error("--force only makes sense with --quantize or --mlx")
     os.makedirs(args.out, exist_ok=True)
     manifest = os.path.join(args.out, "manifest.json")
     if os.path.exists(manifest):  # never leave an old manifest beside a half-written new export
@@ -222,8 +438,7 @@ def main():
             requests = json.load(f) + generated_cases()
         sess = ort.InferenceSession(check_path, providers=["CPUExecutionProvider"])
         fixtures, worst = [], 0.0
-        n_decisive = agree_decisive = near_ties = near_ties_flipped = 0
-        max_dp = max_dact = 0.0
+        stats = dict(n_decisive=0, agree_decisive=0, near_ties=0, near_ties_flipped=0, max_dp=0.0, max_dact=0.0)
         for req in requests:
             case = {"state": req["state"], "questions": req["questions"], "is_english": is_english(req["state"]),
                     "encoded": {}, "raw": {}, "errors": []}
@@ -251,44 +466,27 @@ def main():
                     worst = max(worst, float(np.abs(out_logits[i, :k] - ref).max()))
                     t = temperature(agent.temperature, agent.temperature_by_options, enc["qtype"], k)
                     p_ort, p_ref = softmax(out_logits[i, :k] / t), softmax(ref / t)
-                    top1_ort, top1_ref = int(np.argmax(p_ort)), int(np.argmax(p_ref))
-                    # Decisive = single option (trivially agrees), or reference top-2 margin > 0.10. With
-                    # |Δp| <= 0.05 per option, only a question whose margin <= 0.10 can flip top-1, so a flip
-                    # on a near-tie is a tie broken differently, not accuracy damage; only decisive questions
-                    # gate the export.
-                    if k == 1:
-                        decisive = True
-                    else:
-                        p_ref_sorted = np.sort(p_ref)[::-1]
-                        decisive = float(p_ref_sorted[0] - p_ref_sorted[1]) > 0.10
-                        if not decisive:
-                            near_ties += 1
-                            near_ties_flipped += int(top1_ort != top1_ref)
-                    if decisive:
-                        n_decisive += 1
-                        agree_decisive += int(top1_ort == top1_ref)
-                    max_dp = max(max_dp, float(np.abs(p_ort - p_ref).max()))
-                    max_dact = max(max_dact, abs(float(out_act[i]) - case["raw"][qid]["act_prob"]))
+                    update_gate(stats, p_ort, p_ref, float(out_act[i]), case["raw"][qid]["act_prob"])
             fixtures.append(case)
         with open(os.path.join(args.out, "fixtures.json"), "w") as f:
             json.dump(fixtures, f, ensure_ascii=False)
         print(f"wrote {len(fixtures)} fixtures; worst ORT-vs-PyTorch logit diff {worst:.2e}")
-        print(f"top-1 agreement on decisive questions {agree_decisive}/{n_decisive}; near-ties {near_ties} "
-              f"({near_ties_flipped} flipped); max |Δp| {max_dp:.4f} (temperature-scaled); "
-              f"max |Δ act_prob| {max_dact:.4f}")
+        print(gate_line(stats))
         if args.quantize is None and worst > 1e-2:
             raise SystemExit("parity self-check failed: ORT output differs from PyTorch")
         if args.quantize in ("int8", "w8"):
             del sess  # release the file before moving or deleting it
-            gate_failed = agree_decisive < n_decisive or max_dp > 0.05 or max_dact > 0.05
-            if gate_failed and not args.force:
+            if gate_failed(stats) and not args.force:
                 raise SystemExit(f"{args.quantize} decision gate failed: top-1 must match on every decisive "
                                   "question (reference top-2 margin > 0.10), |Δp| <= 0.05 and |Δ act_prob| <= 0.05 "
                                   "on every question; kept the fp32 model.onnx (rerun with --force to override)")
-            if gate_failed:
+            if gate_failed(stats):
                 print(f"WARNING: {args.quantize} decision gate failed (see numbers above) but --force was given; "
                       "writing the quantized model.onnx anyway")
             os.replace(check_path, onnx_path)
+        if args.mlx:
+            checkpoint_dir = resolve_checkpoint_dir(args.repo, args.subfolder)
+            mlx_export_and_gate(agent, checkpoint_dir, args.out, fixtures, args.force)
     finally:
         # Any exception or interrupt before the gate (or a gate failure) leaves the quantized temp file
         # behind unless we clean it up here; a successful gate already moved it onto onnx_path.
