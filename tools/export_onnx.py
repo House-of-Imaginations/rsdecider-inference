@@ -1,7 +1,7 @@
 """Export a Laya checkpoint to ONNX + fixtures for rsdecider.
 
 Usage:
-  python tools/export_onnx.py --out models/english [--quantize int8|w8]       # repo root = English
+  python tools/export_onnx.py --out models/english [--quantize int8|w8 [--force]]  # repo root = English
   python tools/export_onnx.py --subfolder multilingual --out models/multilingual
 
 Writes <out>/model.onnx, tokenizer.json, laya.json, fixtures.json and self-checks ORT vs PyTorch.
@@ -109,6 +109,8 @@ def generated_cases():
                        "criteria": {"cancel": "cancel the plan", "retain": "offer a discount"}}}},
         {"state": "Multiple production databases are corrupted and customer data may be lost.", "questions": {
             "sev": {"type": "score", "instructions": "Severity", "criteria": ["ok", "warning", "critical"]}}},
+        {"state": "The server room temperature is 42C and rising.", "questions": {
+            "sev": {"type": "score", "instructions": "Severity", "criteria": ["ok", "warning", "critical"]}}},
         {"state": "Thanks, that solved it!", "questions": {"resolved": {"type": "noul", "instructions": "Is the issue resolved?"}}},
         {"state": {"ticket_id": 1002, "priority": "high", "tags": ["billing", "refund"]},
          "questions": {"tag": {"type": "choice", "instructions": "Pick the primary tag",
@@ -152,7 +154,12 @@ def main():
     ap.add_argument("--subfolder", default=None, help="checkpoint subfolder, e.g. multilingual; omit for the repo root")
     ap.add_argument("--out", required=True)
     ap.add_argument("--quantize", choices=["int8", "w8"])
+    ap.add_argument("--force", action="store_true",
+                     help="with --quantize, replace model.onnx with the quantized model even if the decision "
+                          "gate fails (prints the gate numbers and a warning first)")
     args = ap.parse_args()
+    if args.force and args.quantize is None:
+        ap.error("--force only makes sense with --quantize")
     os.makedirs(args.out, exist_ok=True)
     torch.backends.mha.set_fastpath_enabled(False)  # fused MHA kernels are not exportable
 
@@ -257,10 +264,14 @@ def main():
             raise SystemExit("parity self-check failed: ORT output differs from PyTorch")
         if args.quantize in ("int8", "w8"):
             del sess  # release the file before moving or deleting it
-            if agree_decisive < n_decisive or max_dp > 0.05 or max_dact > 0.05:
+            gate_failed = agree_decisive < n_decisive or max_dp > 0.05 or max_dact > 0.05
+            if gate_failed and not args.force:
                 raise SystemExit(f"{args.quantize} decision gate failed: top-1 must match on every decisive "
                                   "question (reference top-2 margin > 0.10), |Δp| <= 0.05 and |Δ act_prob| <= 0.05 "
-                                  "on every question; kept the fp32 model.onnx")
+                                  "on every question; kept the fp32 model.onnx (rerun with --force to override)")
+            if gate_failed:
+                print(f"WARNING: {args.quantize} decision gate failed (see numbers above) but --force was given; "
+                      "writing the quantized model.onnx anyway")
             os.replace(check_path, onnx_path)
     finally:
         # Any exception or interrupt before the gate (or a gate failure) leaves the quantized temp file
