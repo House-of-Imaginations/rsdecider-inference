@@ -92,8 +92,9 @@ The same request again returns in `0.1 ms` with `"cached": true`. A Vietnamese `
 > You need Rust 1.85+ (edition 2024) and Python 3.10+ for the one-time model export. Docker is only needed for
 > `self-hosted/` and the Redis/e2e test suites; [k6](https://k6.io) only for `stress/`.
 
-**1. Export the models** (once; needs Python 3.10+). Writes `models/<name>/{model.onnx, tokenizer.json, laya.json}` and
-self-checks ONNX Runtime against PyTorch.
+**1. Export the models** (once; needs Python 3.10+). Writes `models/<name>/{model.onnx, tokenizer.json, laya.json,
+fixtures.json, manifest.json}` and self-checks ONNX Runtime against PyTorch. (Or download them, see
+[Getting the models](#getting-the-models).)
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r tools/requirements.txt
@@ -115,6 +116,27 @@ cp rsdecider.example.toml rsdecider.toml
 ./target/release/rsdecider serve --config rsdecider.toml
 curl localhost:3000/readyz                                 # → ready
 ```
+
+### Getting the models
+
+Each model folder carries a `manifest.json` (size + SHA-256 of every file, written last by the export). Either export
+the models (step 1 above), or set `download` on a `[[models]]` entry to a base URL serving an exported folder
+(`<download>/manifest.json`, `<download>/model.onnx`, …) and let rsdecider fetch it:
+
+```bash
+rsdecider models check --config rsdecider.toml             # full size + SHA-256 check; non-zero exit if anything is off
+rsdecider models pull  --config rsdecider.toml             # download missing/corrupt files (--model english for one)
+```
+
+`serve` checks file sizes before loading. If a folder is missing or broken and has a `download` URL, it asks on a
+terminal (`Download 568 MB from …? [y/N]`); with `--download-models` or `RSDECIDER_DOWNLOAD_MODELS=1` it downloads
+without asking; otherwise it exits with the export command. Folders exported before manifests existed still load
+(`ok (no manifest, not verified)`).
+
+> [!NOTE]
+> The shipped configs leave `download` commented out: exports aren't published yet. Point it at wherever you host
+> an exported folder (any HTTP(S) server, e.g. a Hugging Face `resolve/<revision>/english` path). Pin `<revision>` to a
+> commit SHA: the hashes come from the same host, so the manifest catches transport errors, not a compromised host.
 
 ## Endpoints
 
@@ -213,6 +235,7 @@ non_english_model = "multilingual"
 [[models]]                              # one table per model
 name               = "english"
 path               = "models/english"   # model.onnx + tokenizer.json + laya.json
+download           = "https://…/english"  # optional: base URL for `models pull` / first-run download (none by default)
 execution_provider = "cpu"              # or "cuda" (build with --features cuda)
 workers            = 1                  # ORT sessions, one blocking thread each
 intra_op_threads   = 6                  # threads per session
@@ -261,6 +284,7 @@ first, then set the queues from the throughput you measure (the `rsdecider_*` me
 | `models.max_batch_items` | Questions per forward pass | under load, to amortise each pass | p99 at low load matters more than throughput |
 | `models.max_batch_tokens` | Padded tokens per pass (memory per batch) | long inputs split into tiny batches | batches spike memory |
 | `models.max_wait_ms` | How long a batch waits to fill | traffic is steady and batches leave half-empty | traffic is sparse (latency is added to every cold request) |
+| `models.download` | Base URL `models pull` and first-run `serve` fetch this folder from | — | — |
 | `models.max_pending` | Queued questions before `529`; the sum across models also caps requests waiting to tokenize | legitimate bursts get `529` while the deadline still has room | memory is tight, or you want to shed earlier |
 | `server.request_timeout_ms` | End-to-end deadline, and so how much queueing admission allows | clients can wait longer | clients should fail fast and retry elsewhere |
 | `keys.rps` / `keys.burst` | Per-client share of capacity (a batch item costs one token) | a client is throttled below what the box can serve | one client can crowd out others |
@@ -330,13 +354,16 @@ Everything for a container deployment lives in [`self-hosted/`](./self-hosted): 
 `docker-compose.yml` with Redis (512 MB, LRU), and the container config `rsdecider.toml`.
 
 ```bash
-# export models into ./models first (see Quick start), then:
 cd self-hosted
+docker compose --profile export up models-export   # once: exports missing models into ../models (slow, ~GBs)
 docker compose up --build
 curl localhost:3000/readyz
 ```
 
-Compose mounts `../models` read-only at `/models` and `self-hosted/rsdecider.toml` at `/etc/rsdecider/rsdecider.toml`;
+`models-export` is opt-in (`profiles: ["export"]`): it installs `tools/requirements.txt` in a Python container and
+exports english and multilingual only where `manifest.json` (written last) is missing (Hugging Face cache in the `hf-cache` volume).
+rsdecider runs with `--download-models`, so once `download` URLs are set in `rsdecider.toml` it fetches missing models
+on start instead. Compose mounts `../models` writable at `/models` and `self-hosted/rsdecider.toml` at `/etc/rsdecider/rsdecider.toml`;
 edit that file (keys, threads, `max_pending`) and restart. Metrics are published on `127.0.0.1:9000` only.
 
 > [!WARNING]
@@ -406,7 +433,7 @@ cargo test --features redis-tests --test redis                    # needs Docker
 
 ```text
 src/
-  main.rs          CLI (serve, hash-key), runtime + metrics setup
+  main.rs          CLI (serve, hash-key, models check/pull), runtime + metrics setup
   api.rs           axum routes, request pipeline, errors
   docs.html        Swagger UI page served at /docs
   auth.rs          hashed API keys + per-key governor limiter
@@ -416,9 +443,10 @@ src/
   scheduler.rs     coalescing, admission, micro-batcher, ORT worker pool
   model/           tokenization, Laya sequence encoding, ONNX session, postprocess
   config.rs        rsdecider.toml schema + validation
+  download.rs      manifest.json check + model folder download
   knobs.rs         advanced [knobs] limits and their defaults
 tests/             api, parity, redis, e2e suites
-tools/             export_onnx.py (PyTorch → ONNX + fixtures)
+tools/             export_onnx.py (PyTorch → ONNX + fixtures + manifest)
 stress/            k6 scenarios, runner, results
 self-hosted/       Dockerfile, docker-compose.yml, container config
 docs/diagrams/     archify sources + interactive HTML

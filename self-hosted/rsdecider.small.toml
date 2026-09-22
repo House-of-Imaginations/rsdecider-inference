@@ -21,6 +21,7 @@ non_english_model = "multilingual"
 [[models]]
 name = "english"
 path = "/models/english"
+# download = "https://huggingface.co/<org>/<repo>/resolve/<revision>/english"  # fill in to download on start (--download-models)
 workers = 1
 max_pending = 32
 max_batch_items = 4
@@ -29,6 +30,7 @@ max_batch_tokens = 2048
 [[models]]
 name = "multilingual"
 path = "/models/multilingual"
+# download = "https://huggingface.co/<org>/<repo>/resolve/<revision>/multilingual"  # fill in to download on start (--download-models)
 workers = 1
 max_pending = 32
 max_batch_items = 4

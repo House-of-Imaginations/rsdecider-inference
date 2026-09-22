@@ -19,6 +19,7 @@ non_english_model = "multilingual"
 [[models]]
 name = "english"
 path = "models/english"   # model.onnx + tokenizer.json + laya.json (tools/export_onnx.py)
+# download = "https://huggingface.co/<org>/<repo>/resolve/<revision>/english"  # fill in once exports are published: `models pull` / first-run download
 execution_provider = "cpu" # or "cuda" (build with --features cuda)
 workers = 1               # ORT sessions, one per blocking thread
 intra_op_threads = 6
@@ -32,6 +33,7 @@ max_wait_ms = 2
 [[models]]
 name = "multilingual"
 path = "models/multilingual"
+# download = "https://huggingface.co/<org>/<repo>/resolve/<revision>/multilingual"
 
 [cache]
 l1_max_bytes = 268435456
