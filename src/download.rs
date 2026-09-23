@@ -8,8 +8,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Files a pre-manifest export folder must have to load.
+/// Files a pre-manifest export folder must have to load, by execution provider.
 const LEGACY: [&str; 3] = ["model.onnx", "tokenizer.json", "laya.json"];
+const MLX_LEGACY: [&str; 4] = ["mlx.safetensors", "mlx.json", "tokenizer.json", "laya.json"];
 /// The only names a manifest may list (they become paths inside the model folder).
 const KNOWN: [&str; 6] = ["model.onnx", "tokenizer.json", "laya.json", "fixtures.json", "mlx.safetensors", "mlx.json"];
 /// Remote manifest.json read cap.
@@ -99,12 +100,14 @@ fn fault(path: &Path, e: &Entry, full: bool) -> Option<Fault> {
 }
 
 /// Checks a model folder against its manifest.json. `full` hashes every file; otherwise sizes only.
-pub fn check(dir: &Path, full: bool) -> Status {
+/// `ep` (the model's `execution_provider`) picks the core files the folder must have on disk, manifest or not.
+pub fn check(dir: &Path, ep: &str, full: bool) -> Status {
+    let legacy: &[&str] = if ep == "mlx" { &MLX_LEGACY } else { &LEGACY };
     let raw = match std::fs::read(dir.join("manifest.json")) {
         Ok(raw) => raw,
         Err(_) => {
             let missing: Vec<String> =
-                LEGACY.iter().filter(|f| !dir.join(f).is_file()).map(|f| f.to_string()).collect();
+                legacy.iter().filter(|f| !dir.join(f).is_file()).map(|f| f.to_string()).collect();
             if missing.is_empty() {
                 return Status::Unverified;
             }
@@ -122,13 +125,20 @@ pub fn check(dir: &Path, full: bool) -> Status {
             None => {}
         }
     }
+    // A manifest from an export without this provider's files (ONNX-only for an mlx model) is complete but unusable.
+    for f in legacy {
+        if !dir.join(f).is_file() && !missing.iter().any(|m| m == f) {
+            missing.push(f.to_string());
+        }
+    }
     if missing.is_empty() && corrupt.is_empty() { Status::Ok } else { Status::Bad { missing, corrupt } }
 }
 
 pub fn export_hint(m: &ModelCfg) -> String {
     format!(
-        "export it with `python tools/export_onnx.py --out {}` (add `--subfolder multilingual` for the multilingual model)",
-        m.path.display()
+        "export it with `python tools/export_onnx.py --out {}{}` (add `--subfolder multilingual` for the multilingual model)",
+        m.path.display(),
+        if m.execution_provider == "mlx" { " --mlx" } else { "" }
     )
 }
 
@@ -326,7 +336,7 @@ mod tests {
         let root = tmp();
         let dir = root.join("english");
         Remote::fetch(&url).await.unwrap().pull("english", &dir).await.unwrap();
-        assert_eq!(check(&dir, true), Status::Ok);
+        assert_eq!(check(&dir, "cpu", true), Status::Ok);
         assert_eq!(std::fs::read(dir.join("model.onnx")).unwrap(), FILES[0].1);
     }
 
@@ -359,7 +369,7 @@ mod tests {
         write(&dir, &[FILES[2], ("tokenizer.json", b"{\"tok\":2}")]);
         Remote::fetch(&url).await.unwrap().pull("english", &dir).await.unwrap();
         assert_eq!(std::fs::read(dir.join("tokenizer.json")).unwrap(), FILES[1].1);
-        assert_eq!(check(&dir, true), Status::Ok);
+        assert_eq!(check(&dir, "cpu", true), Status::Ok);
     }
 
     #[test]
@@ -367,23 +377,58 @@ mod tests {
         let dir = tmp();
         write(&dir, &FILES);
         std::fs::write(dir.join("manifest.json"), manifest_for(&FILES)).unwrap();
-        assert_eq!(check(&dir, true), Status::Ok);
+        assert_eq!(check(&dir, "cpu", true), Status::Ok);
         std::fs::remove_file(dir.join("laya.json")).unwrap();
         std::fs::write(dir.join("model.onnx"), b"weights weights weightX").unwrap(); // same size, wrong hash
-        let s = check(&dir, true);
+        let s = check(&dir, "cpu", true);
         assert_eq!(s, Status::Bad { missing: vec!["laya.json".into()], corrupt: vec!["model.onnx".into()] });
         assert_eq!(s.to_string(), "missing laya.json; corrupt model.onnx");
-        assert!(!check(&dir, false).usable(), "cheap check still sees the missing file");
+        assert!(!check(&dir, "cpu", false).usable(), "cheap check still sees the missing file");
     }
 
     #[test]
     fn cheap_check_accepts_legacy_and_rejects_size_mismatch() {
         let dir = tmp();
         write(&dir, &FILES);
-        assert_eq!(check(&dir, false), Status::Unverified);
+        assert_eq!(check(&dir, "cpu", false), Status::Unverified);
         std::fs::write(dir.join("manifest.json"), manifest_for(&FILES)).unwrap();
         std::fs::write(dir.join("tokenizer.json"), b"short").unwrap();
-        assert_eq!(check(&dir, false), Status::Bad { missing: vec![], corrupt: vec!["tokenizer.json".into()] });
+        assert_eq!(check(&dir, "cpu", false), Status::Bad { missing: vec![], corrupt: vec!["tokenizer.json".into()] });
+    }
+
+    #[test]
+    fn cheap_check_uses_mlx_core_files_for_mlx_provider() {
+        let dir = tmp();
+        const MLX_FILES: [(&str, &[u8]); 4] = [
+            ("mlx.safetensors", b"mlx weights mlx weights"),
+            ("mlx.json", b"{\"hidden\":1}"),
+            ("tokenizer.json", b"{\"tok\":1}"),
+            ("laya.json", b"{}"),
+        ];
+        // model.onnx (the cpu-provider core file) is absent, but the mlx core files are present, so an mlx
+        // model checks as unverified while a cpu model reports model.onnx missing.
+        write(&dir, &MLX_FILES);
+        assert_eq!(check(&dir, "mlx", false), Status::Unverified);
+        let Status::Bad { missing, .. } = check(&dir, "cpu", false) else { panic!("expected Bad") };
+        assert_eq!(missing, vec!["manifest.json", "model.onnx"]);
+        std::fs::remove_file(dir.join("mlx.json")).unwrap();
+        let Status::Bad { missing, .. } = check(&dir, "mlx", false) else { panic!("expected Bad") };
+        assert_eq!(missing, vec!["manifest.json", "mlx.json"]);
+    }
+
+    #[test]
+    fn manifest_check_requires_core_files_of_the_provider() {
+        // An ONNX-only export (manifest without mlx.*) must not pass for an mlx model.
+        let dir = tmp();
+        write(&dir, &FILES);
+        std::fs::write(dir.join("manifest.json"), manifest_for(&FILES)).unwrap();
+        assert_eq!(check(&dir, "cpu", false), Status::Ok);
+        let s = check(&dir, "mlx", false);
+        assert_eq!(s, Status::Bad { missing: vec!["mlx.safetensors".into(), "mlx.json".into()], corrupt: vec![] });
+        let mut m = model(None);
+        assert!(!export_hint(&m).contains("--mlx"));
+        m.execution_provider = "mlx".into();
+        assert!(export_hint(&m).contains("--mlx"), "{}", export_hint(&m));
     }
 
     #[test]

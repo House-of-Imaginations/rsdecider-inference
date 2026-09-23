@@ -81,6 +81,17 @@ pub struct ModelCfg {
     pub max_wait_ms: u64,
     /// Base URL the model folder is fetched from (`<download>/manifest.json`, ...); see `rsdecider models pull`.
     pub download: Option<String>,
+    /// Only used when `execution_provider = "mlx"`.
+    #[serde(default)]
+    pub mlx_dtype: MlxDtype,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MlxDtype {
+    #[default]
+    Fp16,
+    Fp32,
 }
 
 fn d_ep() -> String {
@@ -162,6 +173,13 @@ impl Config {
             }
             if m.workers == 0 || m.max_batch_items == 0 || m.intra_op_threads == 0 {
                 return Err(format!("model {:?}: workers, max_batch_items and intra_op_threads must be >= 1", m.name));
+            }
+            #[cfg(not(feature = "mlx"))]
+            if m.execution_provider == "mlx" {
+                return Err(format!(
+                    "model {:?}: execution_provider = \"mlx\" needs a binary built with --features mlx",
+                    m.name
+                ));
             }
             if let Some(u) = &m.download
                 && !(u.starts_with("https://") || u.starts_with("http://"))
@@ -309,5 +327,28 @@ burst = 40
     fn rejects_zero_worker_threads() {
         let s = format!("[server]\nworker_threads = 0\n{BASE}");
         assert!(Config::from_toml_str(&s).unwrap_err().contains("worker_threads"));
+    }
+
+    #[test]
+    fn mlx_dtype_defaults_to_fp16_and_parses() {
+        let c = Config::from_toml_str(BASE).unwrap();
+        assert_eq!(c.models[0].mlx_dtype, MlxDtype::Fp16);
+        let s = BASE.replace("path = \"models/english\"", "path = \"models/english\"\nmlx_dtype = \"fp32\"");
+        let c = Config::from_toml_str(&s).unwrap();
+        assert_eq!(c.models[0].mlx_dtype, MlxDtype::Fp32);
+    }
+
+    #[test]
+    fn mlx_dtype_rejects_unknown_value() {
+        let s = BASE.replace("path = \"models/english\"", "path = \"models/english\"\nmlx_dtype = \"int8\"");
+        assert!(Config::from_toml_str(&s).is_err());
+    }
+
+    #[test]
+    #[cfg(not(feature = "mlx"))]
+    fn mlx_execution_provider_without_feature_names_the_flag() {
+        let s = BASE.replace("path = \"models/english\"", "path = \"models/english\"\nexecution_provider = \"mlx\"");
+        let err = Config::from_toml_str(&s).unwrap_err();
+        assert!(err.contains("--features mlx"), "{err}");
     }
 }

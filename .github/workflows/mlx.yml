@@ -1,0 +1,31 @@
+name: mlx
+
+# Apple Silicon build check: compiles the mlx feature and runs its unit tests. Parity and benchmarks stay local
+# (tools/export_onnx.py --mlx, cargo test --features parity,mlx --test parity, stress/) because GitHub's macOS
+# VMs may not expose Metal, so a real forward pass can't be trusted to run here.
+on:
+  push:
+    branches: ['**']
+    paths: ['src/**', 'tests/**', 'openapi.yaml', 'Cargo.toml', 'Cargo.lock', '.github/workflows/mlx.yml']
+  pull_request:
+    paths: ['src/**', 'tests/**', 'openapi.yaml', 'Cargo.toml', 'Cargo.lock', '.github/workflows/mlx.yml']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  mlx:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy }
+      - uses: Swatinem/rust-cache@v2
+      - run: command -v cmake || brew install cmake
+      - run: cargo build --locked --features mlx
+      - run: cargo clippy --locked --all-targets --features mlx,parity -- -D warnings
+      - run: cargo test --locked --features mlx --lib

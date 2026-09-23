@@ -236,9 +236,10 @@ non_english_model = "multilingual"
 name               = "english"
 path               = "models/english"   # model.onnx + tokenizer.json + laya.json
 download           = "https://…/english"  # optional: base URL for `models pull` / first-run download (none by default)
-execution_provider = "cpu"              # or "cuda" (build with --features cuda)
-workers            = 1                  # ORT sessions, one blocking thread each
-intra_op_threads   = 6                  # threads per session
+execution_provider = "cpu"              # or "cuda" (--features cuda) or "mlx" (--features mlx, Apple Silicon)
+workers            = 1                  # ORT sessions, one blocking thread each; MLX wants 1 (see Apple Silicon below)
+intra_op_threads   = 6                  # threads per session; unused by "mlx"
+mlx_dtype          = "fp16"             # or "fp32"; only used when execution_provider = "mlx"
 max_pending        = 256                # queued questions before 529 (memory bound)
 max_batch_items    = 8                  # questions per forward pass
 max_batch_tokens   = 8192               # padded tokens per forward pass
@@ -326,7 +327,8 @@ in normal operation. Copy it and mount your models.
 **RAM floor:** loading both fp32 models takes about 2.9 GB, and that's without Redis (512 MB in
 `self-hosted/docker-compose.yml`) or the 256 MiB in-process L1 cache — count those in if you run them on the same
 host, and plan closer to 4 GB just for the models. With 2 GB, load only one model (drop the `[[models]]` table you
-don't need and point `[routing]` at the one you keep).
+don't need and point `[routing]` at the one you keep). On MLX (Apple Silicon, below) plan ~5–6 GB footprint for both
+models under load.
 
 **w8 (opt-in, not the default):** `tools/export_onnx.py --quantize w8` runs 8-bit weight-only quantization (ORT
 `MatMulNBitsQuantizer`, block_size=128, symmetric, accuracy_level=4) behind the same decision gate as int8 (below).
@@ -347,6 +349,48 @@ against the fp32 reference on every fixture question, `|Δp| <= 0.05` and `|Δ a
 every *decisive* question — one where the fp32 top-2 probability margin is `> 0.10` (or there's only one option).
 With `|Δp| <= 0.05` per option, a flip is only possible when the margin is `<= 0.10`, so a flip there is a tie broken
 differently, not damage. `--force` bypasses a failed gate for a single export run; it never changes the thresholds.
+
+### Apple Silicon (MLX)
+
+macOS on Apple Silicon only — the `mlx` feature won't compile anywhere else (`compile_error!` outside
+`target_os = "macos"` + `aarch64`). It runs the same forward pass as ORT (same inputs, same postprocessing) directly
+on the GPU via [MLX](https://github.com/ml-explore/mlx) instead of ONNX Runtime.
+
+**Prerequisites:** full Xcode (the Command Line Tools alone have no `metal` compiler), selected with
+`sudo xcode-select -s /Applications/Xcode.app`; on Xcode 26 or newer also `xcodebuild -downloadComponent MetalToolchain`;
+and [cmake](https://cmake.org). The first build downloads the MLX sources (needs network) and compiles them (about
+3 minutes on an M1 Pro).
+
+```bash
+cargo build --release --features mlx
+.venv/bin/python tools/export_onnx.py --out models/english --mlx   # writes mlx.safetensors + mlx.json beside model.onnx
+```
+
+Point a model at it in `rsdecider.toml`:
+
+```toml
+execution_provider = "mlx"
+mlx_dtype          = "fp16"   # or "fp32"; fp16 is the default and what the checkpoint ships
+workers            = 1        # MLX shares one GPU; more workers add memory, not throughput (also warned at startup)
+```
+
+`intra_op_threads` and `[knobs] ort_global_threads` are ORT-only and don't apply to `"mlx"`.
+
+**Moving the binary:** it loads MLX's Metal kernels from `mlx.metallib`, at a path under the builder's
+`~/.mlx/lib/<key>/` that is compiled in at build time. To run it on another Mac or as another user, ship that
+`mlx.metallib` next to the binary. If `~/.mlx` was removed on the build machine, `cargo clean -p mlx-sys` and rebuild.
+
+**Measured end-to-end** (M1 Pro, fp16, real models, k6, one release binary serving both backends — full numbers and
+caveats: [Run 5, `stress/results/2026-09-21-m1pro.md`](./stress/results/2026-09-21-m1pro.md)): at cold 3 req/s
+(3 questions/request) MLX's p50/p99 are 69/108 ms vs ORT CPU's 353/860 ms. MLX first sheds (`529`) around 25–30 req/s
+cold vs ORT CPU's ~3 req/s — roughly **8–10×** — but that knee was found with the stress config's `max_pending` 48/64
+(sized for ORT), so it is a lower bound set by queue size, not a measured GPU saturation point or MLX's capacity. At
+the same 100 req/s overload, MLX serves ~6× more `200`s (5,251 vs 878) with 0 `504`s (ORT: 13) and p99 1.43 s vs
+9.73 s. These are single k6 runs on a shared desktop host, not repeated for variance — treat exact multiples loosely,
+the directional gap is not noise. MLX is *not* lower on memory: `ps -o rss` misses GPU/unified-memory-resident
+allocations MLX uses, and macOS `footprint` grows with load from ~2.9 GB (cold 6 req/s) to ~5.6 GB (overload
+100 req/s); on the two paired runs it was sampled on, MLX 5.03/5.57 GB vs ORT 3.11/4.33 GB. Budget ~5–6 GB for both
+models under load on MLX.
 
 ## Self-hosted (Docker)
 
@@ -411,10 +455,11 @@ Measured with k6 against the real fp32 models on an Apple M1 Pro (10 cores), CPU
 | Cold, 6 req/s | 15% shed as `529`, accepted p99 6.5 s (inside the 10 s deadline) |
 | Overload, 100 req/s (~30× capacity) | only `200` and `529` — **0 timeouts, 0 5xx**, queue drains to 0, ~6% padding |
 | 90k-char states, 40–200 req/s | model queue sheds the excess as `529`, peak RSS 2.2 GB, 0.4–0.5% of accepted requests `504` |
+| MLX fp16 (Apple Silicon only), cold 3 req/s | p50 **69 ms** / p99 **108 ms** vs ORT CPU's 353 / 860 ms in the same run (Run 5; the other rows are Run 4); first `529`s at ~25–30 req/s vs ORT CPU's ~3 req/s — a lower bound set by the stress config's `max_pending`, not measured GPU capacity |
 
 Cold capacity is inference-bound (~10 questions/s English, ~4/s multilingual). The biggest lever is the model, not the
-server: a GPU/CoreML execution provider, or an opt-in w8 export once you accept its trade-off (see Small machines
-above). Full numbers:
+server: a GPU/CoreML execution provider (MLX on Apple Silicon, see above), or an opt-in w8 export once you accept its
+trade-off (see Small machines above). Full numbers:
 [`stress/results/2026-09-21-m1pro.md`](./stress/results/2026-09-21-m1pro.md). Re-run with `stress/run.sh` against a
 running server (`-e RATE=…` per scenario; see the script).
 
@@ -423,6 +468,7 @@ running server (`-e RATE=…` per scenario; see the script).
 ```bash
 cargo test                                                        # unit + API tests (fake backend, no models)
 MODEL_DIR=models/english cargo test --release --features parity --test parity   # ONNX vs PyTorch fixtures
+MODEL_DIR=models/english cargo test --release --features parity,mlx --test parity   # + MLX (Apple Silicon)
 cargo test --features redis-tests --test redis                    # needs Docker (testcontainers)
 (cd self-hosted && docker compose up -d) && cargo test --features e2e --test e2e
 ./target/release/rsdecider serve --fake-delay-ms 20               # server without models, for overhead tests
