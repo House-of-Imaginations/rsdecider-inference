@@ -241,6 +241,7 @@ redis_timeout_ms             = 250      # per Redis command; then cache miss / l
 idempotency_local_max_bytes  = 67108864 # in-process idempotency store (64 MiB)
 idempotency_max_stored_bytes = 262144   # larger responses re-run on repeat (256 KiB)
 # ort_global_threads          = 4       # one shared ORT intra-op pool for every session; per-model intra_op_threads then ignored
+# admission_headroom          = 0.8     # fraction of the remaining deadline admission may predict a request will fill
 ```
 
 The server refuses to start on an invalid file (unknown routing target, duplicate names, zero workers, bad key hash)
@@ -274,7 +275,8 @@ first, then set the queues from the throughput you measure (the `rsdecider_*` me
   multilingual `2`, tokenize `1`, HTTP `2` ([`stress/rsdecider.stress.toml`](./stress/rsdecider.stress.toml)).
 - **`max_pending ≈ items/s × 1–2 s`.** Latency is protected separately: admission estimates queue time from tokens, not
   items (EMA seconds/token × (tokens already queued + this request's own) ÷ workers), and returns `529` up front when
-  the work can't finish by the deadline.
+  the work can't finish within `knobs.admission_headroom` of the deadline — real batch times scatter above the mean
+  estimate, so admitting all the way to the deadline would turn saturation into late `504`s instead.
 - **Biggest lever:** cold capacity is inference-bound, so the model beats any server knob — a GPU
   (`cargo build --release --features cuda`, `execution_provider = "cuda"`) today; int8 (`tools/export_onnx.py
   --quantize int8`) once an export passes the decision gate (see Small machines below).
@@ -289,6 +291,7 @@ first, then set the queues from the throughput you measure (the `rsdecider_*` me
 | `knobs.idempotency_local_max_bytes` | 64 MiB | no Redis and many `Idempotency-Key` clients |
 | `knobs.idempotency_max_stored_bytes` | 256 KiB | responses are large and must still replay |
 | `knobs.ort_global_threads` | per-session `intra_op_threads` | CPU is scarce — one shared ORT intra-op pool (n − 1 threads plus each running batch's caller) across every session instead of one pool per session |
+| `knobs.admission_headroom` | `0.8` | real batch times scatter around the mean estimate; lower it to shed sooner (fewer late `504`s, more `529`s), raise it (up to `1.0`) to admit closer to the full deadline |
 
 ### Small machines
 
@@ -413,6 +416,9 @@ openapi.yaml       HTTP API
 ## Known limits
 
 - Batches are admitted all-or-nothing, so under contention large `/v1/decide/batch` calls lose to single requests.
-- Admission costs requests per token, but under a flood of maximum-length inputs about 0.4–0.5% of accepted requests
-  still hit `504` (measured with k6 on the same host; the cause is not proven).
+- Admission predicts cost from a mean per-token estimate, but real batch times scatter above it, so a request admitted
+  right up to the deadline can finish late (`504`). Before `knobs.admission_headroom` (default `0.8`) existed, this hit
+  0.4–0.5% of accepted requests under a flood of maximum-length inputs, and 12–17% on `cold` at 6 req/s with
+  `max_pending = 256`. With the headroom, the `cold` run had 0 `504`s; the long-input run has not been re-measured.
+  Lower the headroom if `504`s persist under your workload.
 - The Redis suite runs in CI (testcontainers); the Docker e2e suite needs exported models, so it runs locally only.

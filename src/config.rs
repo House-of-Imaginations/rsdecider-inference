@@ -252,6 +252,7 @@ burst = 40
         let c = Config::from_toml_str(BASE).unwrap();
         assert_eq!((c.knobs.tokenize_queue, c.knobs.redis_timeout_ms), (None, 250));
         assert_eq!(c.knobs.ort_global_threads, None);
+        assert_eq!(c.knobs.admission_headroom, 0.8);
         let c =
             Config::from_toml_str(&format!("{BASE}\n[knobs]\ntokenize_queue = 64\nredis_timeout_ms = 100\n")).unwrap();
         assert_eq!((c.knobs.tokenize_queue, c.knobs.redis_timeout_ms), (Some(64), 100));
@@ -262,6 +263,10 @@ burst = 40
         assert!(err("idempotency_max_stored_bytes = 999999999999").contains("idempotency_local_max_bytes"));
         assert!(err("redis_timout_ms = 5").contains("unknown field"), "typos are rejected");
         assert!(err("ort_global_threads = 0").contains("knobs.ort_global_threads must be >= 1"));
+        assert!(err("admission_headroom = 0").contains("knobs.admission_headroom must be in (0, 1]"));
+        assert!(err("admission_headroom = 1.5").contains("knobs.admission_headroom must be in (0, 1]"));
+        let c = Config::from_toml_str(&format!("{BASE}\n[knobs]\nadmission_headroom = 1.0\n")).unwrap();
+        assert_eq!(c.knobs.admission_headroom, 1.0);
     }
 
     #[test]
