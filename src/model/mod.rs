@@ -1,3 +1,5 @@
+#[cfg(feature = "mlx")]
+pub mod mlx;
 pub mod postprocess;
 pub mod pyjson;
 pub mod sequence;

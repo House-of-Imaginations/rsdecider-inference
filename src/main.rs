@@ -69,7 +69,7 @@ fn main() -> Result<(), String> {
             let cfg = Config::load(&config)?;
             let mut bad = 0;
             for m in &cfg.models {
-                let s = download::check(&m.path, true);
+                let s = download::check(&m.path, &m.execution_provider, true);
                 println!("{}: {s}", m.name);
                 bad += usize::from(!s.usable());
             }
@@ -84,7 +84,7 @@ fn main() -> Result<(), String> {
             }
             block_on(async {
                 for m in cfg.models.iter().filter(|m| model.as_ref().is_none_or(|n| n == &m.name)) {
-                    let s = download::check(&m.path, true);
+                    let s = download::check(&m.path, &m.execution_provider, true);
                     if s.usable() {
                         println!("{}: {s}", m.name);
                         continue;
@@ -98,7 +98,7 @@ fn main() -> Result<(), String> {
                         ));
                     };
                     Remote::fetch(url).await?.pull(&m.name, &m.path).await?;
-                    println!("{}: {}", m.name, download::check(&m.path, true));
+                    println!("{}: {}", m.name, download::check(&m.path, &m.execution_provider, true));
                 }
                 Ok(())
             })
@@ -135,7 +135,7 @@ fn block_on<T>(f: impl std::future::Future<Output = Result<T, String>>) -> Resul
 fn ensure_models(cfg: &Config, download_flag: bool) -> Result<(), String> {
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     for m in &cfg.models {
-        let status = download::check(&m.path, false);
+        let status = download::check(&m.path, &m.execution_provider, false);
         if status.usable() {
             continue;
         }
@@ -175,6 +175,28 @@ fn ort_factory(m: &ModelCfg, _lm: &LoadedModel, global_pool: bool) -> BackendFac
     Arc::new(move || OrtBackend::new(&path, &ep, intra, global_pool).map(|b| Box::new(b) as Box<dyn Backend>))
 }
 
+/// Dispatches on `execution_provider`: `"mlx"` goes to [`rsdecider::model::mlx::MlxBackend`] (when the binary was
+/// built with `--features mlx`), everything else keeps today's ORT path.
+fn backend_factory(m: &ModelCfg, lm: &LoadedModel, global_pool: bool) -> BackendFactory {
+    if m.execution_provider == "mlx" {
+        #[cfg(feature = "mlx")]
+        {
+            let (dir, dtype) = (m.path.clone(), m.mlx_dtype);
+            return Arc::new(move || {
+                rsdecider::model::mlx::MlxBackend::new(&dir, dtype).map(|b| Box::new(b) as Box<dyn Backend>)
+            });
+        }
+        #[cfg(not(feature = "mlx"))]
+        {
+            let name = m.name.clone();
+            return Arc::new(move || {
+                Err(format!("model {name:?}: execution_provider = \"mlx\" needs a binary built with --features mlx"))
+            });
+        }
+    }
+    ort_factory(m, lm, global_pool)
+}
+
 async fn serve(cfg: Config, path: PathBuf, fake_delay_ms: Option<u64>) -> Result<(), String> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
@@ -191,18 +213,25 @@ async fn serve(cfg: Config, path: PathBuf, fake_delay_ms: Option<u64>) -> Result
     });
 
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    // MLX models share one GPU stream per worker, not intra_op_threads: they count `workers` threads.
+    let model_threads =
+        |m: &ModelCfg| if m.execution_provider == "mlx" { m.workers } else { m.workers * m.intra_op_threads };
     let threads = cfg.server.worker_threads
         + cfg.server.tokenize_threads
         + match cfg.knobs.ort_global_threads {
             // Each concurrent Run's calling thread computes alongside the pool's n - 1 threads.
             Some(n) => n - 1 + cfg.models.iter().map(|m| m.workers).sum::<usize>(),
-            None => cfg.models.iter().map(|m| m.workers * m.intra_op_threads).sum::<usize>(),
+            None => cfg.models.iter().map(model_threads).sum::<usize>(),
         };
     if threads > cores {
         tracing::warn!("thread budget {threads} exceeds {cores} cores; expect contention");
     }
     for m in &cfg.models {
-        let size = std::fs::metadata(m.path.join("model.onnx")).map(|x| x.len()).unwrap_or(0);
+        if m.execution_provider == "mlx" && m.workers > 1 {
+            tracing::warn!(model = %m.name, "MLX shares one GPU; workers > 1 adds memory, not throughput");
+        }
+        let weights_file = if m.execution_provider == "mlx" { "mlx.safetensors" } else { "model.onnx" };
+        let size = std::fs::metadata(m.path.join(weights_file)).map(|x| x.len()).unwrap_or(0);
         tracing::info!(model = %m.name, "estimated resident weights: {} MiB", (m.workers as u64 * size) >> 20);
     }
 
@@ -214,7 +243,7 @@ async fn serve(cfg: Config, path: PathBuf, fake_delay_ms: Option<u64>) -> Result
         }
         None => {
             let global_pool = cfg.knobs.ort_global_threads.is_some();
-            api::build(cfg.clone(), &move |m, lm| ort_factory(m, lm, global_pool)).await?
+            api::build(cfg.clone(), &move |m, lm| backend_factory(m, lm, global_pool)).await?
         }
     };
 
