@@ -6,9 +6,9 @@ name: mlx
 on:
   push:
     branches: ['**']
-    paths: ['src/**', 'src/model/mlx.rs', 'tests/**', 'openapi.yaml', 'Cargo.toml', 'Cargo.lock', '.github/workflows/mlx.yml']
+    paths: ['src/**', 'tests/**', 'openapi.yaml', 'Cargo.toml', 'Cargo.lock', '.github/workflows/mlx.yml']
   pull_request:
-    paths: ['src/**', 'src/model/mlx.rs', 'tests/**', 'openapi.yaml', 'Cargo.toml', 'Cargo.lock', '.github/workflows/mlx.yml']
+    paths: ['src/**', 'tests/**', 'openapi.yaml', 'Cargo.toml', 'Cargo.lock', '.github/workflows/mlx.yml']
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -19,11 +19,13 @@ permissions:
 
 jobs:
   mlx:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy }
       - uses: Swatinem/rust-cache@v2
       - run: command -v cmake || brew install cmake
       - run: cargo build --locked --features mlx
+      - run: cargo clippy --locked --all-targets --features mlx,parity -- -D warnings
       - run: cargo test --locked --features mlx --lib
