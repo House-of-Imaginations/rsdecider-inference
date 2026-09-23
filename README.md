@@ -455,7 +455,7 @@ Measured with k6 against the real fp32 models on an Apple M1 Pro (10 cores), CPU
 | Cold, 6 req/s | 15% shed as `529`, accepted p99 6.5 s (inside the 10 s deadline) |
 | Overload, 100 req/s (~30× capacity) | only `200` and `529` — **0 timeouts, 0 5xx**, queue drains to 0, ~6% padding |
 | 90k-char states, 40–200 req/s | model queue sheds the excess as `529`, peak RSS 2.2 GB, 0.4–0.5% of accepted requests `504` |
-| MLX fp16 (Apple Silicon only), cold 3 req/s | p50 **69 ms** / p99 **108 ms** vs ORT CPU's 353 / 860 ms in the same run (Run 5; the row above is Run 4); first `529`s at ~25–30 req/s vs ORT CPU's ~3 req/s — a lower bound set by the stress config's `max_pending`, not measured GPU capacity |
+| MLX fp16 (Apple Silicon only), cold 3 req/s | p50 **69 ms** / p99 **108 ms** vs ORT CPU's 353 / 860 ms in the same run (Run 5; the other rows are Run 4); first `529`s at ~25–30 req/s vs ORT CPU's ~3 req/s — a lower bound set by the stress config's `max_pending`, not measured GPU capacity |
 
 Cold capacity is inference-bound (~10 questions/s English, ~4/s multilingual). The biggest lever is the model, not the
 server: a GPU/CoreML execution provider (MLX on Apple Silicon, see above), or an opt-in w8 export once you accept its

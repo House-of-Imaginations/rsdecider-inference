@@ -166,6 +166,11 @@ fn ensure_models(cfg: &Config, download_flag: bool) -> Result<(), String> {
                 remote.pull(&m.name, &m.path).await.map_err(with_hint)
             })?,
         }
+        // The remote may not carry this provider's files (e.g. no MLX export): say so here, with the export hint.
+        let after = download::check(&m.path, &m.execution_provider, false);
+        if !after.usable() {
+            return Err(with_hint(format!("still not usable after download ({after})")));
+        }
     }
     Ok(())
 }

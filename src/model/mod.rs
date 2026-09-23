@@ -87,7 +87,10 @@ fn fingerprint(dir: &Path, mlx: Option<MlxDtype>) -> Result<[u8; 32], String> {
         }
     }
     if let Some(dt) = mlx {
-        h.update(format!("mlx-{dt:?}").to_lowercase());
+        h.update(match dt {
+            MlxDtype::Fp16 => "mlx-fp16",
+            MlxDtype::Fp32 => "mlx-fp32",
+        });
     }
     Ok(h.finalize().into())
 }
