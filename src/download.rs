@@ -100,12 +100,12 @@ fn fault(path: &Path, e: &Entry, full: bool) -> Option<Fault> {
 }
 
 /// Checks a model folder against its manifest.json. `full` hashes every file; otherwise sizes only.
-/// `ep` (the model's `execution_provider`) picks the core files a manifest-less folder is checked against.
+/// `ep` (the model's `execution_provider`) picks the core files the folder must have on disk, manifest or not.
 pub fn check(dir: &Path, ep: &str, full: bool) -> Status {
+    let legacy: &[&str] = if ep == "mlx" { &MLX_LEGACY } else { &LEGACY };
     let raw = match std::fs::read(dir.join("manifest.json")) {
         Ok(raw) => raw,
         Err(_) => {
-            let legacy: &[&str] = if ep == "mlx" { &MLX_LEGACY } else { &LEGACY };
             let missing: Vec<String> =
                 legacy.iter().filter(|f| !dir.join(f).is_file()).map(|f| f.to_string()).collect();
             if missing.is_empty() {
@@ -125,13 +125,20 @@ pub fn check(dir: &Path, ep: &str, full: bool) -> Status {
             None => {}
         }
     }
+    // A manifest from an export without this provider's files (ONNX-only for an mlx model) is complete but unusable.
+    for f in legacy {
+        if !dir.join(f).is_file() && !missing.iter().any(|m| m == f) {
+            missing.push(f.to_string());
+        }
+    }
     if missing.is_empty() && corrupt.is_empty() { Status::Ok } else { Status::Bad { missing, corrupt } }
 }
 
 pub fn export_hint(m: &ModelCfg) -> String {
     format!(
-        "export it with `python tools/export_onnx.py --out {}` (add `--subfolder multilingual` for the multilingual model)",
-        m.path.display()
+        "export it with `python tools/export_onnx.py --out {}{}` (add `--subfolder multilingual` for the multilingual model)",
+        m.path.display(),
+        if m.execution_provider == "mlx" { " --mlx" } else { "" }
     )
 }
 
@@ -407,6 +414,21 @@ mod tests {
         std::fs::remove_file(dir.join("mlx.json")).unwrap();
         let Status::Bad { missing, .. } = check(&dir, "mlx", false) else { panic!("expected Bad") };
         assert_eq!(missing, vec!["manifest.json", "mlx.json"]);
+    }
+
+    #[test]
+    fn manifest_check_requires_core_files_of_the_provider() {
+        // An ONNX-only export (manifest without mlx.*) must not pass for an mlx model.
+        let dir = tmp();
+        write(&dir, &FILES);
+        std::fs::write(dir.join("manifest.json"), manifest_for(&FILES)).unwrap();
+        assert_eq!(check(&dir, "cpu", false), Status::Ok);
+        let s = check(&dir, "mlx", false);
+        assert_eq!(s, Status::Bad { missing: vec!["mlx.safetensors".into(), "mlx.json".into()], corrupt: vec![] });
+        let mut m = model(None);
+        assert!(!export_hint(&m).contains("--mlx"));
+        m.execution_provider = "mlx".into();
+        assert!(export_hint(&m).contains("--mlx"), "{}", export_hint(&m));
     }
 
     #[test]

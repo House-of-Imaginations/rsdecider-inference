@@ -38,7 +38,7 @@ fn model_dir() -> PathBuf {
 
 /// Encodes every fixture question and checks ids/markers against Laya's.
 fn load_items(dir: &Path) -> (LoadedModel, Vec<Value>, Vec<Item>) {
-    let model = LoadedModel::load("parity", dir).unwrap();
+    let model = LoadedModel::load("parity", dir, None).unwrap();
     let fixtures: Vec<Value> =
         serde_json::from_str(&std::fs::read_to_string(dir.join("fixtures.json")).unwrap()).unwrap();
     let mask = model.meta.mask_token.clone();

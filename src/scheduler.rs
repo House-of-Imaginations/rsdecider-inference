@@ -155,6 +155,8 @@ impl Scheduler {
                     .spawn(move || worker(ctx, ready))
                     .map_err(|e| e.to_string())?;
             }
+            // Only workers hold senders now: one that panics in its factory disconnects instead of hanging recv.
+            drop(ready_tx);
             for _ in 0..spec.workers {
                 ready_rx.recv().map_err(|_| format!("model {}: worker exited during startup", spec.name))??;
             }
@@ -393,6 +395,7 @@ fn worker(ctx: WorkerCtx, ready: std_mpsc::Sender<Result<(), String>>) {
             return;
         }
     };
+    drop(ready); // a live worker must not keep startup waiting on a sibling that panicked
     loop {
         let msg = ctx.rx.lock().unwrap().recv();
         let Ok((items, idle_permit)) = msg else { return };
@@ -713,6 +716,26 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1), "failed fast, not at the deadline");
         assert!(s.map.lock().unwrap().is_empty());
         assert_eq!(s.models[0].permits.available_permits(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn panicking_factory_fails_startup_instead_of_hanging() {
+        // Worker 0 builds fine and worker 1 panics (either may run first): start must return Err, not block.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fake = Fake::default();
+        let factory: BackendFactory = Arc::new(move || {
+            if calls.fetch_add(1, SeqCst) == 0 { Ok(Box::new(fake.clone())) } else { panic!("factory panicked") }
+        });
+        let spec = ModelSpec { factory, workers: 2, ..spec("m", &Fake::default(), 4, 8, 8192) };
+        let cache = Arc::new(Cache::new(&CacheCfg::default(), Duration::from_millis(250)).await.unwrap());
+        let (rt, (tx, rx)) = (tokio::runtime::Handle::current(), std_mpsc::channel());
+        // A plain thread, not spawn_blocking: a hung start must not also hang runtime shutdown.
+        std::thread::spawn(move || {
+            let _rt = rt.enter();
+            let _ = tx.send(Scheduler::start(vec![spec], cache).err());
+        });
+        let err = rx.recv_timeout(Duration::from_secs(5)).expect("start hung").expect("start succeeded");
+        assert!(err.contains("worker exited during startup"), "{err}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

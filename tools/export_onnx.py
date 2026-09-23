@@ -391,10 +391,17 @@ def main():
     args = ap.parse_args()
     if args.force and args.quantize is None and not args.mlx:
         ap.error("--force only makes sense with --quantize or --mlx")
+    if args.mlx:  # fail now, not after the multi-minute ONNX export
+        try:
+            import mlx.core  # noqa: F401
+        except ImportError:
+            raise SystemExit("--mlx needs Apple Silicon and `pip install mlx`")
     os.makedirs(args.out, exist_ok=True)
-    manifest = os.path.join(args.out, "manifest.json")
-    if os.path.exists(manifest):  # never leave an old manifest beside a half-written new export
-        os.remove(manifest)
+    # Never leave an old manifest beside a half-written new export, nor old-checkpoint mlx.* files that a run
+    # without --mlx (or a failed --mlx gate) would let the new manifest vouch for.
+    for stale in ("manifest.json", "mlx.safetensors", "mlx.json"):
+        if os.path.exists(os.path.join(args.out, stale)):
+            os.remove(os.path.join(args.out, stale))
     torch.backends.mha.set_fastpath_enabled(False)  # fused MHA kernels are not exportable
 
     agent = laya.load(args.repo, device="cpu", subfolder=args.subfolder)

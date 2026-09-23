@@ -5,6 +5,7 @@ pub mod pyjson;
 pub mod sequence;
 pub mod session;
 
+use crate::config::MlxDtype;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -37,7 +38,8 @@ pub struct LoadedModel {
 }
 
 impl LoadedModel {
-    pub fn load(name: &str, dir: &Path) -> Result<Self, String> {
+    /// `mlx` is the dtype when the model is served by the MLX backend (`None` = ORT).
+    pub fn load(name: &str, dir: &Path, mlx: Option<MlxDtype>) -> Result<Self, String> {
         let meta_path = dir.join("laya.json");
         let meta: LayaMeta = serde_json::from_str(
             &std::fs::read_to_string(&meta_path).map_err(|e| format!("{}: {e}", meta_path.display()))?,
@@ -48,20 +50,7 @@ impl LoadedModel {
         // Laya calls the HF tokenizer per segment with no truncation/padding.
         tokenizer.with_truncation(None).map_err(|e| e.to_string())?;
         tokenizer.with_padding(None);
-        let mut h = Sha256::new();
-        for f in ["model.onnx", "tokenizer.json", "laya.json"] {
-            let p = dir.join(f);
-            let mut file = std::fs::File::open(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-            let mut buf = vec![0u8; 1 << 20];
-            loop {
-                let n = file.read(&mut buf).map_err(|e| e.to_string())?;
-                if n == 0 {
-                    break;
-                }
-                h.update(&buf[..n]);
-            }
-        }
-        Ok(Self { name: name.into(), dir: dir.into(), meta, tokenizer, fingerprint: h.finalize().into() })
+        Ok(Self { name: name.into(), dir: dir.into(), meta, tokenizer, fingerprint: fingerprint(dir, mlx)? })
     }
 
     /// `laya-<name>@<first 12 hex chars of the fingerprint>`
@@ -77,6 +66,30 @@ impl LoadedModel {
     pub fn tokenize_prefix(&self, text: &str, need: usize) -> Result<Vec<u32>, String> {
         tokenize_prefix(&self.tokenizer, text, need)
     }
+}
+
+/// sha256 over the weights file actually served (`model.onnx`, or `mlx.safetensors` plus an `mlx-fp16`/`mlx-fp32`
+/// tag), tokenizer.json and laya.json. Cache keys and the response `model` name derive from it, so ORT and MLX
+/// answers never share them; ORT's value is unchanged from before MLX existed.
+fn fingerprint(dir: &Path, mlx: Option<MlxDtype>) -> Result<[u8; 32], String> {
+    let mut h = Sha256::new();
+    let weights = if mlx.is_some() { "mlx.safetensors" } else { "model.onnx" };
+    for f in [weights, "tokenizer.json", "laya.json"] {
+        let p = dir.join(f);
+        let mut file = std::fs::File::open(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+        }
+    }
+    if let Some(dt) = mlx {
+        h.update(format!("mlx-{dt:?}").to_lowercase());
+    }
+    Ok(h.finalize().into())
 }
 
 /// Leading tokens of `text`, enough to fill `need` positions: tokenizes a prefix cut at whitespace and keeps
@@ -145,6 +158,27 @@ mod tests {
         ];
         out.retain(|(_, t)| t.len() > 8 * 512);
         out
+    }
+
+    #[test]
+    fn fingerprint_separates_ort_and_mlx_over_one_folder() {
+        let dir = std::env::temp_dir().join(format!("rsdecider-fp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let files: [(&str, &[u8]); 4] =
+            [("model.onnx", b"onnx"), ("mlx.safetensors", b"mlx"), ("tokenizer.json", b"tok"), ("laya.json", b"{}")];
+        for (n, b) in files {
+            std::fs::write(dir.join(n), b).unwrap();
+        }
+        let ort = fingerprint(&dir, None).unwrap();
+        // ORT keeps its pre-MLX fingerprint (model.onnx, tokenizer.json, laya.json), so existing caches stay valid.
+        assert_eq!(ort, <[u8; 32]>::from(Sha256::digest(b"onnxtok{}")));
+        let fp16 = fingerprint(&dir, Some(MlxDtype::Fp16)).unwrap();
+        let fp32 = fingerprint(&dir, Some(MlxDtype::Fp32)).unwrap();
+        assert!(ort != fp16 && ort != fp32 && fp16 != fp32);
+        // An MLX-only folder (no model.onnx) still loads for MLX.
+        std::fs::remove_file(dir.join("model.onnx")).unwrap();
+        assert_eq!(fingerprint(&dir, Some(MlxDtype::Fp16)).unwrap(), fp16);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -110,7 +110,7 @@ pub async fn build(
     let mut models = Vec::new();
     let mut specs = Vec::new();
     for m in &cfg.models {
-        let lm = LoadedModel::load(&m.name, &m.path)?;
+        let lm = LoadedModel::load(&m.name, &m.path, (m.execution_provider == "mlx").then_some(m.mlx_dtype))?;
         if m.max_batch_tokens < lm.meta.max_len {
             return Err(format!(
                 "model {:?}: max_batch_tokens {} < laya max_len {}",

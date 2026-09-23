@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use rsdecider::config::{Config, ModelCfg};
+use rsdecider::config::{Config, MlxDtype, ModelCfg};
 use rsdecider::download::{self, Action, Remote};
 use rsdecider::fake::Fake;
 use rsdecider::model::LoadedModel;
@@ -231,7 +231,10 @@ async fn serve(cfg: Config, path: PathBuf, fake_delay_ms: Option<u64>) -> Result
             tracing::warn!(model = %m.name, "MLX shares one GPU; workers > 1 adds memory, not throughput");
         }
         let weights_file = if m.execution_provider == "mlx" { "mlx.safetensors" } else { "model.onnx" };
-        let size = std::fs::metadata(m.path.join(weights_file)).map(|x| x.len()).unwrap_or(0);
+        let mut size = std::fs::metadata(m.path.join(weights_file)).map(|x| x.len()).unwrap_or(0);
+        if m.execution_provider == "mlx" && m.mlx_dtype == MlxDtype::Fp32 {
+            size *= 2; // ponytail: mlx.safetensors is fp16 (bar the small fp32 act head); fp32 upcasts it in memory
+        }
         tracing::info!(model = %m.name, "estimated resident weights: {} MiB", (m.workers as u64 * size) >> 20);
     }
 

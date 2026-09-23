@@ -14,7 +14,7 @@ use mlx_rs::fast::{layer_norm, rope, scaled_dot_product_attention};
 use mlx_rs::ops::indexing::topk_axis;
 use mlx_rs::ops::{addmm, concatenate, erf, maximum, select, softmax_axis, stack};
 use mlx_rs::transforms::eval;
-use mlx_rs::{Array, Dtype};
+use mlx_rs::{Array, Device, DeviceType, Dtype};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -49,6 +49,11 @@ pub struct MlxBackend {
 
 impl MlxBackend {
     pub fn new(dir: &Path, dtype: MlxDtype) -> Result<Self, String> {
+        // With no usable Metal GPU, MLX silently runs on the CPU; refuse rather than serve at a fraction of the speed.
+        let dev = Device::try_default().map_err(|e| e.to_string())?;
+        if !matches!(dev.get_type().map_err(|e| e.to_string())?, DeviceType::Gpu) {
+            return Err(format!("MLX default device is {dev}, not the GPU (no Metal device?)"));
+        }
         let json = dir.join("mlx.json");
         let cfg = std::fs::read_to_string(&json)
             .map_err(|e| e.to_string())
