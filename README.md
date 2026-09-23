@@ -236,9 +236,10 @@ non_english_model = "multilingual"
 name               = "english"
 path               = "models/english"   # model.onnx + tokenizer.json + laya.json
 download           = "https://…/english"  # optional: base URL for `models pull` / first-run download (none by default)
-execution_provider = "cpu"              # or "cuda" (build with --features cuda)
-workers            = 1                  # ORT sessions, one blocking thread each
-intra_op_threads   = 6                  # threads per session
+execution_provider = "cpu"              # or "cuda" (--features cuda) or "mlx" (--features mlx, Apple Silicon)
+workers            = 1                  # ORT sessions, one blocking thread each; MLX wants 1 (see Apple Silicon below)
+intra_op_threads   = 6                  # threads per session; unused by "mlx"
+mlx_dtype          = "fp16"             # or "fp32"; only used when execution_provider = "mlx"
 max_pending        = 256                # queued questions before 529 (memory bound)
 max_batch_items    = 8                  # questions per forward pass
 max_batch_tokens   = 8192               # padded tokens per forward pass
@@ -347,6 +348,39 @@ against the fp32 reference on every fixture question, `|Δp| <= 0.05` and `|Δ a
 every *decisive* question — one where the fp32 top-2 probability margin is `> 0.10` (or there's only one option).
 With `|Δp| <= 0.05` per option, a flip is only possible when the margin is `<= 0.10`, so a flip there is a tie broken
 differently, not damage. `--force` bypasses a failed gate for a single export run; it never changes the thresholds.
+
+### Apple Silicon (MLX)
+
+macOS on Apple Silicon only — the `mlx` feature won't compile anywhere else (`compile_error!` outside
+`target_os = "macos"` + `aarch64`). It runs the same forward pass as ORT (same inputs, same postprocessing) directly
+on the GPU via [MLX](https://github.com/ml-explore/mlx) instead of ONNX Runtime.
+
+**Prerequisites:** [cmake](https://cmake.org) and the Xcode command line tools; MLX compiles from source on the
+first build (about 3 minutes on an M1 Pro). You also need the Metal Toolchain, which a full Xcode install does not
+always include: `xcodebuild -downloadComponent MetalToolchain`.
+
+```bash
+cargo build --release --features mlx
+.venv/bin/python tools/export_onnx.py --out models/english --mlx   # writes mlx.safetensors + mlx.json beside model.onnx
+```
+
+Point a model at it in `rsdecider.toml`:
+
+```toml
+execution_provider = "mlx"
+mlx_dtype          = "fp16"   # or "fp32"; fp16 is the default and what the checkpoint ships
+workers            = 1        # MLX shares one GPU; more workers add memory, not throughput (also warned at startup)
+```
+
+`intra_op_threads` and `[knobs] ort_global_threads` are ORT-only and don't apply to `"mlx"`.
+
+If `--mlx` ever exits non-zero after printing its `mlx …` gate line, the export itself may already be complete —
+`rsdecider models check` tells you whether the folder is actually missing anything before you re-export.
+
+**Forward-pass-only numbers** (M1 Pro, fp16, English model; replaced by an end-to-end benchmark in a later task):
+55 ms at 1×256 tokens, 396 ms at 8×256, 783 ms at 16×256 — fp16 is only about 15–20% faster than fp32 at these
+shapes. The earlier spike's forward-pass comparison against the ORT CPU backend: English 8×512 7.2 s → 0.8 s,
+multilingual 4×1024 3.5 s → 0.35 s.
 
 ## Self-hosted (Docker)
 
