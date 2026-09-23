@@ -377,10 +377,14 @@ workers            = 1        # MLX shares one GPU; more workers add memory, not
 If `--mlx` ever exits non-zero after printing its `mlx …` gate line, the export itself may already be complete —
 `rsdecider models check` tells you whether the folder is actually missing anything before you re-export.
 
-**Forward-pass-only numbers** (M1 Pro, fp16, English model; replaced by an end-to-end benchmark in a later task):
-55 ms at 1×256 tokens, 396 ms at 8×256, 783 ms at 16×256 — fp16 is only about 15–20% faster than fp32 at these
-shapes. The earlier spike's forward-pass comparison against the ORT CPU backend: English 8×512 7.2 s → 0.8 s,
-multilingual 4×1024 3.5 s → 0.35 s.
+**Measured end-to-end** (M1 Pro, fp16, real models, k6, one release binary serving both backends — full numbers and
+caveats: [Run 5, `stress/results/2026-09-21-m1pro.md`](./stress/results/2026-09-21-m1pro.md)): at cold 3 req/s
+(3 questions/request) MLX's p99 is 108 ms vs ORT CPU's 860 ms, and MLX's cold capacity knee (first `529`s) sits
+around 25–30 req/s vs ORT CPU's ~3 req/s — roughly **8–10×**. At the same 100 req/s overload, MLX serves ~6× more
+`200`s (5,251 vs 878) with 0 `504`s (ORT: 13) and p99 1.43 s vs 9.73 s. These are single k6 runs on a shared desktop
+host, not repeated for variance — treat exact multiples loosely, the directional gap is not noise. MLX's peak memory
+is *not* lower than ORT's: `ps -o rss` misses GPU/unified-memory-resident allocations MLX uses, and macOS `footprint`
+shows MLX at 5.0–5.6 GB vs ORT's 3.1–4.3 GB on the same runs.
 
 ## Self-hosted (Docker)
 
@@ -445,10 +449,11 @@ Measured with k6 against the real fp32 models on an Apple M1 Pro (10 cores), CPU
 | Cold, 6 req/s | 15% shed as `529`, accepted p99 6.5 s (inside the 10 s deadline) |
 | Overload, 100 req/s (~30× capacity) | only `200` and `529` — **0 timeouts, 0 5xx**, queue drains to 0, ~6% padding |
 | 90k-char states, 40–200 req/s | model queue sheds the excess as `529`, peak RSS 2.2 GB, 0.4–0.5% of accepted requests `504` |
+| MLX fp16 (Apple Silicon only), cold 3 req/s | p99 **108 ms** vs ORT CPU's 860 ms; cold capacity knee ~25–30 req/s vs ORT CPU's ~3 req/s |
 
 Cold capacity is inference-bound (~10 questions/s English, ~4/s multilingual). The biggest lever is the model, not the
-server: a GPU/CoreML execution provider, or an opt-in w8 export once you accept its trade-off (see Small machines
-above). Full numbers:
+server: a GPU/CoreML execution provider (MLX on Apple Silicon, see above), or an opt-in w8 export once you accept its
+trade-off (see Small machines above). Full numbers:
 [`stress/results/2026-09-21-m1pro.md`](./stress/results/2026-09-21-m1pro.md). Re-run with `stress/run.sh` against a
 running server (`-e RATE=…` per scenario; see the script).
 
