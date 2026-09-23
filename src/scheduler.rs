@@ -573,8 +573,8 @@ mod tests {
         let fake = Fake { fail_with: Some("boom".into()), ..Fake::default() };
         let s = sched(vec![spec("m", &fake, 4, 8, 8192)]).await;
         assert_eq!(s.run_jobs(vec![job(1, 0, 4)], secs(5)).await.unwrap_err(), SchedError::Backend("boom".into()));
-        assert!(s.map.lock().unwrap().is_empty());
-        assert_eq!(s.models[0].permits.available_permits(), 4);
+        // The worker sends the error before dropping the item, whose Drop clears the entry and frees the permit.
+        wait_until(|| s.map.lock().unwrap().is_empty() && s.models[0].permits.available_permits() == 4).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
