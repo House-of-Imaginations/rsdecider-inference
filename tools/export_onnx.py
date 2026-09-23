@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 import types
 
 import numpy as np
@@ -493,6 +494,13 @@ def main():
         if check_path != onnx_path and os.path.exists(check_path):
             os.remove(check_path)
     write_manifest(args.out)  # last: only a folder whose model.onnx is final gets a manifest
+    if args.mlx:
+        # ponytail: mlx's Metal/libc++ teardown can SIGABRT during interpreter exit even after a fully
+        # correct export (this manifest included), turning a real success into a misleading non-zero exit.
+        # Skip teardown on this success path only — failures still fall through to the normal exit.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":
