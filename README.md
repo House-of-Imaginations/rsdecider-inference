@@ -327,7 +327,8 @@ in normal operation. Copy it and mount your models.
 **RAM floor:** loading both fp32 models takes about 2.9 GB, and that's without Redis (512 MB in
 `self-hosted/docker-compose.yml`) or the 256 MiB in-process L1 cache — count those in if you run them on the same
 host, and plan closer to 4 GB just for the models. With 2 GB, load only one model (drop the `[[models]]` table you
-don't need and point `[routing]` at the one you keep).
+don't need and point `[routing]` at the one you keep). On MLX (Apple Silicon, below) plan ~5–6 GB footprint for both
+models under load.
 
 **w8 (opt-in, not the default):** `tools/export_onnx.py --quantize w8` runs 8-bit weight-only quantization (ORT
 `MatMulNBitsQuantizer`, block_size=128, symmetric, accuracy_level=4) behind the same decision gate as int8 (below).
@@ -355,9 +356,10 @@ macOS on Apple Silicon only — the `mlx` feature won't compile anywhere else (`
 `target_os = "macos"` + `aarch64`). It runs the same forward pass as ORT (same inputs, same postprocessing) directly
 on the GPU via [MLX](https://github.com/ml-explore/mlx) instead of ONNX Runtime.
 
-**Prerequisites:** [cmake](https://cmake.org) and the Xcode command line tools; MLX compiles from source on the
-first build (about 3 minutes on an M1 Pro). You also need the Metal Toolchain, which a full Xcode install does not
-always include: `xcodebuild -downloadComponent MetalToolchain`.
+**Prerequisites:** full Xcode (the Command Line Tools alone have no `metal` compiler), selected with
+`sudo xcode-select -s /Applications/Xcode.app`; on Xcode 26 or newer also `xcodebuild -downloadComponent MetalToolchain`;
+and [cmake](https://cmake.org). The first build downloads the MLX sources (needs network) and compiles them (about
+3 minutes on an M1 Pro).
 
 ```bash
 cargo build --release --features mlx
@@ -374,17 +376,21 @@ workers            = 1        # MLX shares one GPU; more workers add memory, not
 
 `intra_op_threads` and `[knobs] ort_global_threads` are ORT-only and don't apply to `"mlx"`.
 
-If `--mlx` ever exits non-zero after printing its `mlx …` gate line, the export itself may already be complete —
-`rsdecider models check` tells you whether the folder is actually missing anything before you re-export.
+**Moving the binary:** it loads MLX's Metal kernels from `mlx.metallib`, at a path under the builder's
+`~/.mlx/lib/<key>/` that is compiled in at build time. To run it on another Mac or as another user, ship that
+`mlx.metallib` next to the binary. If `~/.mlx` was removed on the build machine, `cargo clean -p mlx-sys` and rebuild.
 
 **Measured end-to-end** (M1 Pro, fp16, real models, k6, one release binary serving both backends — full numbers and
 caveats: [Run 5, `stress/results/2026-09-21-m1pro.md`](./stress/results/2026-09-21-m1pro.md)): at cold 3 req/s
-(3 questions/request) MLX's p99 is 108 ms vs ORT CPU's 860 ms, and MLX's cold capacity knee (first `529`s) sits
-around 25–30 req/s vs ORT CPU's ~3 req/s — roughly **8–10×**. At the same 100 req/s overload, MLX serves ~6× more
-`200`s (5,251 vs 878) with 0 `504`s (ORT: 13) and p99 1.43 s vs 9.73 s. These are single k6 runs on a shared desktop
-host, not repeated for variance — treat exact multiples loosely, the directional gap is not noise. MLX's peak memory
-is *not* lower than ORT's: `ps -o rss` misses GPU/unified-memory-resident allocations MLX uses, and macOS `footprint`
-shows MLX at 5.0–5.6 GB vs ORT's 3.1–4.3 GB on the same runs.
+(3 questions/request) MLX's p50/p99 are 69/108 ms vs ORT CPU's 353/860 ms. MLX first sheds (`529`) around 25–30 req/s
+cold vs ORT CPU's ~3 req/s — roughly **8–10×** — but that knee was found with the stress config's `max_pending` 48/64
+(sized for ORT), so it is a lower bound set by queue size, not a measured GPU saturation point or MLX's capacity. At
+the same 100 req/s overload, MLX serves ~6× more `200`s (5,251 vs 878) with 0 `504`s (ORT: 13) and p99 1.43 s vs
+9.73 s. These are single k6 runs on a shared desktop host, not repeated for variance — treat exact multiples loosely,
+the directional gap is not noise. MLX is *not* lower on memory: `ps -o rss` misses GPU/unified-memory-resident
+allocations MLX uses, and macOS `footprint` grows with load from ~2.9 GB (cold 6 req/s) to ~5.6 GB (overload
+100 req/s); on the two paired runs it was sampled on, MLX 5.03/5.57 GB vs ORT 3.11/4.33 GB. Budget ~5–6 GB for both
+models under load on MLX.
 
 ## Self-hosted (Docker)
 
@@ -449,7 +455,7 @@ Measured with k6 against the real fp32 models on an Apple M1 Pro (10 cores), CPU
 | Cold, 6 req/s | 15% shed as `529`, accepted p99 6.5 s (inside the 10 s deadline) |
 | Overload, 100 req/s (~30× capacity) | only `200` and `529` — **0 timeouts, 0 5xx**, queue drains to 0, ~6% padding |
 | 90k-char states, 40–200 req/s | model queue sheds the excess as `529`, peak RSS 2.2 GB, 0.4–0.5% of accepted requests `504` |
-| MLX fp16 (Apple Silicon only), cold 3 req/s | p99 **108 ms** vs ORT CPU's 860 ms; cold capacity knee ~25–30 req/s vs ORT CPU's ~3 req/s |
+| MLX fp16 (Apple Silicon only), cold 3 req/s | p50 **69 ms** / p99 **108 ms** vs ORT CPU's 353 / 860 ms in the same run (Run 5; the row above is Run 4); first `529`s at ~25–30 req/s vs ORT CPU's ~3 req/s — a lower bound set by the stress config's `max_pending`, not measured GPU capacity |
 
 Cold capacity is inference-bound (~10 questions/s English, ~4/s multilingual). The biggest lever is the model, not the
 server: a GPU/CoreML execution provider (MLX on Apple Silicon, see above), or an opt-in w8 export once you accept its
@@ -462,6 +468,7 @@ running server (`-e RATE=…` per scenario; see the script).
 ```bash
 cargo test                                                        # unit + API tests (fake backend, no models)
 MODEL_DIR=models/english cargo test --release --features parity --test parity   # ONNX vs PyTorch fixtures
+MODEL_DIR=models/english cargo test --release --features parity,mlx --test parity   # + MLX (Apple Silicon)
 cargo test --features redis-tests --test redis                    # needs Docker (testcontainers)
 (cd self-hosted && docker compose up -d) && cargo test --features e2e --test e2e
 ./target/release/rsdecider serve --fake-delay-ms 20               # server without models, for overhead tests
