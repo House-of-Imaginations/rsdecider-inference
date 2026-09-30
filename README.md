@@ -467,7 +467,7 @@ running server (`-e RATE=…` per scenario; see the script).
 
 ```bash
 cargo test                                                        # unit + API tests (fake backend, no models)
-MODEL_DIR=models/english cargo test --release --features parity --test parity   # ONNX vs PyTorch fixtures
+MODEL_DIR=models/english cargo test --release --features parity --test parity   # ONNX vs PyTorch fixtures (fp32 folders; w8 is checked by the export gate)
 MODEL_DIR=models/english cargo test --release --features parity,mlx --test parity   # + MLX (Apple Silicon)
 cargo test --features redis-tests --test redis                    # needs Docker (testcontainers)
 (cd self-hosted && docker compose up -d) && cargo test --features e2e --test e2e

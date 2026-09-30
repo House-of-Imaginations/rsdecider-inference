@@ -105,6 +105,10 @@ pub fn check(dir: &Path, ep: &str, full: bool) -> Status {
     let legacy: &[&str] = if ep == "mlx" { &MLX_LEGACY } else { &LEGACY };
     let raw = match std::fs::read(dir.join("manifest.json")) {
         Ok(raw) => raw,
+        // Only a manifest that isn't there means a legacy folder; one we can't read must not be bypassed.
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Status::Bad { missing: vec![], corrupt: vec!["manifest.json".into()] };
+        }
         Err(_) => {
             let missing: Vec<String> =
                 legacy.iter().filter(|f| !dir.join(f).is_file()).map(|f| f.to_string()).collect();
@@ -433,6 +437,14 @@ mod tests {
         assert!(!export_hint(&m).contains("--mlx"));
         m.execution_provider = "mlx".into();
         assert!(export_hint(&m).contains("--mlx"), "{}", export_hint(&m));
+    }
+
+    #[test]
+    fn unreadable_manifest_is_not_a_legacy_folder() {
+        let dir = tmp();
+        write(&dir, &FILES);
+        std::fs::create_dir(dir.join("manifest.json")).unwrap(); // exists, but reading it fails
+        assert_eq!(check(&dir, "cpu", false), Status::Bad { missing: vec![], corrupt: vec!["manifest.json".into()] });
     }
 
     #[test]
