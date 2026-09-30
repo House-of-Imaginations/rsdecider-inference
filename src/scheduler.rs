@@ -709,7 +709,8 @@ mod tests {
         let s = sched(vec![ModelSpec { factory, ..spec("m", &Fake::default(), 4, 8, 8192) }]).await;
         let r = s.run_jobs(vec![job(7, 0, 4)], secs(5)).await;
         assert_eq!(r.unwrap_err(), SchedError::Backend("inference worker panicked".into()));
-        assert!(!s.ready(), "a model with no live workers is not ready");
+        // The worker fails the batch first, then tries the rebuild and retires; wait for that.
+        wait_until(|| !s.ready()).await; // a model with no live workers is not ready
         let started = Instant::now();
         let r = s.run_jobs(vec![job(1, 0, 4)], secs(5)).await;
         assert_eq!(r.unwrap_err(), SchedError::Backend("model workers unavailable".into()));
