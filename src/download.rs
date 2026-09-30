@@ -102,6 +102,10 @@ fn fault(path: &Path, e: &Entry, full: bool) -> Option<Fault> {
 pub fn check(dir: &Path, full: bool) -> Status {
     let raw = match std::fs::read(dir.join("manifest.json")) {
         Ok(raw) => raw,
+        // Only a manifest that isn't there means a legacy folder; one we can't read must not be bypassed.
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Status::Bad { missing: vec![], corrupt: vec!["manifest.json".into()] };
+        }
         Err(_) => {
             let missing: Vec<String> =
                 LEGACY.iter().filter(|f| !dir.join(f).is_file()).map(|f| f.to_string()).collect();
@@ -384,6 +388,14 @@ mod tests {
         std::fs::write(dir.join("manifest.json"), manifest_for(&FILES)).unwrap();
         std::fs::write(dir.join("tokenizer.json"), b"short").unwrap();
         assert_eq!(check(&dir, false), Status::Bad { missing: vec![], corrupt: vec!["tokenizer.json".into()] });
+    }
+
+    #[test]
+    fn unreadable_manifest_is_not_a_legacy_folder() {
+        let dir = tmp();
+        write(&dir, &FILES);
+        std::fs::create_dir(dir.join("manifest.json")).unwrap(); // exists, but reading it fails
+        assert_eq!(check(&dir, false), Status::Bad { missing: vec![], corrupt: vec!["manifest.json".into()] });
     }
 
     #[test]
