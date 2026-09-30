@@ -98,7 +98,16 @@ fn main() -> Result<(), String> {
                         ));
                     };
                     Remote::fetch(url).await?.pull(&m.name, &m.path).await?;
-                    println!("{}: {}", m.name, download::check(&m.path, &m.execution_provider, true));
+                    // The remote may not carry this provider's files (e.g. no MLX export): fail, don't exit 0.
+                    let after = download::check(&m.path, &m.execution_provider, true);
+                    if !after.usable() {
+                        return Err(format!(
+                            "model {:?}: still not usable after download ({after}); {}",
+                            m.name,
+                            download::export_hint(m)
+                        ));
+                    }
+                    println!("{}: {after}", m.name);
                 }
                 Ok(())
             })
