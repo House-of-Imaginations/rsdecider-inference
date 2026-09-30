@@ -68,13 +68,14 @@ impl LoadedModel {
     }
 }
 
-/// sha256 over the weights file actually served (`model.onnx`, or `mlx.safetensors` plus an `mlx-fp16`/`mlx-fp32`
-/// tag), tokenizer.json and laya.json. Cache keys and the response `model` name derive from it, so ORT and MLX
-/// answers never share them; ORT's value is unchanged from before MLX existed.
+/// sha256 over the weights actually served (`model.onnx`, or `mlx.safetensors` + `mlx.json` plus an
+/// `mlx-fp16`/`mlx-fp32` tag), tokenizer.json and laya.json. Cache keys and the response `model` name derive
+/// from it, so ORT and MLX answers never share them; ORT's value is unchanged from before MLX existed.
 fn fingerprint(dir: &Path, mlx: Option<MlxDtype>) -> Result<[u8; 32], String> {
     let mut h = Sha256::new();
-    let weights = if mlx.is_some() { "mlx.safetensors" } else { "model.onnx" };
-    for f in [weights, "tokenizer.json", "laya.json"] {
+    // mlx.json sets the MLX architecture (layers, windows, RoPE), so it is part of what is served.
+    let weights: &[&str] = if mlx.is_some() { &["mlx.safetensors", "mlx.json"] } else { &["model.onnx"] };
+    for f in weights.iter().chain(&["tokenizer.json", "laya.json"]) {
         let p = dir.join(f);
         let mut file = std::fs::File::open(&p).map_err(|e| format!("{}: {e}", p.display()))?;
         let mut buf = vec![0u8; 1 << 20];
@@ -169,11 +170,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let files: [(&str, &[u8]); 4] =
             [("model.onnx", b"onnx"), ("mlx.safetensors", b"mlx"), ("tokenizer.json", b"tok"), ("laya.json", b"{}")];
+        std::fs::write(dir.join("mlx.json"), b"{\"layers\":1}").unwrap();
         for (n, b) in files {
             std::fs::write(dir.join(n), b).unwrap();
         }
         let ort = fingerprint(&dir, None).unwrap();
-        // ORT keeps its pre-MLX fingerprint (model.onnx, tokenizer.json, laya.json), so existing caches stay valid.
+        // ORT keeps its pre-MLX fingerprint (model.onnx, tokenizer.json, laya.json; mlx.json is ignored), so
+        // existing caches stay valid.
         assert_eq!(ort, <[u8; 32]>::from(Sha256::digest(b"onnxtok{}")));
         let fp16 = fingerprint(&dir, Some(MlxDtype::Fp16)).unwrap();
         let fp32 = fingerprint(&dir, Some(MlxDtype::Fp32)).unwrap();
@@ -181,6 +184,8 @@ mod tests {
         // An MLX-only folder (no model.onnx) still loads for MLX.
         std::fs::remove_file(dir.join("model.onnx")).unwrap();
         assert_eq!(fingerprint(&dir, Some(MlxDtype::Fp16)).unwrap(), fp16);
+        std::fs::write(dir.join("mlx.json"), b"{\"layers\":2}").unwrap();
+        assert_ne!(fingerprint(&dir, Some(MlxDtype::Fp16)).unwrap(), fp16, "mlx.json is hashed");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

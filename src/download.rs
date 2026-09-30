@@ -125,9 +125,10 @@ pub fn check(dir: &Path, ep: &str, full: bool) -> Status {
             None => {}
         }
     }
-    // A manifest from an export without this provider's files (ONNX-only for an mlx model) is complete but unusable.
+    // A manifest from an export without this provider's files (ONNX-only for an mlx model) is complete but unusable,
+    // even if stale copies from an older export sit on disk: they must be listed, so they are verified.
     for f in legacy {
-        if !dir.join(f).is_file() && !missing.iter().any(|m| m == f) {
+        if !m.files.contains_key(*f) {
             missing.push(f.to_string());
         }
     }
@@ -423,8 +424,11 @@ mod tests {
         write(&dir, &FILES);
         std::fs::write(dir.join("manifest.json"), manifest_for(&FILES)).unwrap();
         assert_eq!(check(&dir, "cpu", false), Status::Ok);
-        let s = check(&dir, "mlx", false);
-        assert_eq!(s, Status::Bad { missing: vec!["mlx.safetensors".into(), "mlx.json".into()], corrupt: vec![] });
+        let want = Status::Bad { missing: vec!["mlx.safetensors".into(), "mlx.json".into()], corrupt: vec![] };
+        assert_eq!(check(&dir, "mlx", false), want);
+        // Stale mlx files from an older export don't count: the manifest doesn't vouch for them.
+        write(&dir, &[("mlx.safetensors", b"old"), ("mlx.json", b"{}")]);
+        assert_eq!(check(&dir, "mlx", false), want);
         let mut m = model(None);
         assert!(!export_hint(&m).contains("--mlx"));
         m.execution_provider = "mlx".into();
