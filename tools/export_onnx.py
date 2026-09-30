@@ -10,7 +10,9 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
+import tempfile
 import types
 
 import numpy as np
@@ -349,7 +351,7 @@ def mlx_export_and_gate(agent, checkpoint_dir, out, fixtures, force):
         if gate_failed(stats) and not force:
             raise SystemExit("mlx decision gate failed: top-1 must match on every decisive question (reference "
                               "top-2 margin > 0.10), |Δp| <= 0.05 and |Δ act_prob| <= 0.05 on every question; "
-                              "no mlx.safetensors/mlx.json written (rerun with --force to override)")
+                              "left the output folder unchanged (rerun with --force to override)")
         if gate_failed(stats):
             print("WARNING: mlx decision gate failed (see numbers above) but --force was given; writing "
                   "mlx.safetensors/mlx.json anyway")
@@ -377,6 +379,20 @@ def write_manifest(out):
         json.dump({"files": files}, f, indent=2)
 
 
+def publish(stage, final):
+    """Moves a finished export from `stage` into `final`. The old manifest and weights (model.onnx, and mlx.* —
+    stale from an older checkpoint if this run has none) go first; the new weights and manifest land last, so an
+    interrupt mid-move leaves the weights missing (rsdecider reports it and can re-download) rather than a
+    manifest-less mix that passes as a legacy export."""
+    last = ["model.onnx", "mlx.json", "mlx.safetensors", "manifest.json"]
+    for name in last:
+        if os.path.exists(os.path.join(final, name)):
+            os.remove(os.path.join(final, name))
+    staged = sorted(os.listdir(stage))
+    for name in [n for n in staged if n not in last] + [n for n in last if n in staged]:
+        os.replace(os.path.join(stage, name), os.path.join(final, name))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default="convaiinnovations/laya")
@@ -396,12 +412,26 @@ def main():
             import mlx.core  # noqa: F401
         except ImportError:
             raise SystemExit("--mlx needs Apple Silicon and `pip install mlx`")
-    os.makedirs(args.out, exist_ok=True)
-    # Never leave an old manifest beside a half-written new export, nor old-checkpoint mlx.* files that a run
-    # without --mlx (or a failed --mlx gate) would let the new manifest vouch for.
-    for stale in ("manifest.json", "mlx.safetensors", "mlx.json"):
-        if os.path.exists(os.path.join(args.out, stale)):
-            os.remove(os.path.join(args.out, stale))
+    final = args.out
+    os.makedirs(final, exist_ok=True)
+    # Build the export in a staging folder inside the target (same filesystem, so the moves are renames; rsdecider
+    # only looks at top-level names). The live files and manifest stay untouched until the export has passed.
+    args.out = tempfile.mkdtemp(prefix=".export-", dir=final)
+    try:
+        export(args)
+        publish(args.out, final)
+    finally:
+        shutil.rmtree(args.out, ignore_errors=True)
+    if args.mlx:
+        # ponytail: mlx's Metal/libc++ teardown can SIGABRT during interpreter exit even after a fully
+        # correct export (this manifest included), turning a real success into a misleading non-zero exit.
+        # Skip teardown on this success path only — failures still fall through to the normal exit.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
+
+
+def export(args):
     torch.backends.mha.set_fastpath_enabled(False)  # fused MHA kernels are not exportable
 
     agent = laya.load(args.repo, device="cpu", subfolder=args.subfolder)
@@ -487,7 +517,7 @@ def main():
             if gate_failed(stats) and not args.force:
                 raise SystemExit(f"{args.quantize} decision gate failed: top-1 must match on every decisive "
                                   "question (reference top-2 margin > 0.10), |Δp| <= 0.05 and |Δ act_prob| <= 0.05 "
-                                  "on every question; kept the fp32 model.onnx (rerun with --force to override)")
+                                  "on every question; left the output folder unchanged (rerun with --force to override)")
             if gate_failed(stats):
                 print(f"WARNING: {args.quantize} decision gate failed (see numbers above) but --force was given; "
                       "writing the quantized model.onnx anyway")
@@ -500,14 +530,7 @@ def main():
         # behind unless we clean it up here; a successful gate already moved it onto onnx_path.
         if check_path != onnx_path and os.path.exists(check_path):
             os.remove(check_path)
-    write_manifest(args.out)  # last: only a folder whose model.onnx is final gets a manifest
-    if args.mlx:
-        # ponytail: mlx's Metal/libc++ teardown can SIGABRT during interpreter exit even after a fully
-        # correct export (this manifest included), turning a real success into a misleading non-zero exit.
-        # Skip teardown on this success path only — failures still fall through to the normal exit.
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(0)
+    write_manifest(args.out)  # last: only an export that passed every check gets a manifest
 
 
 if __name__ == "__main__":

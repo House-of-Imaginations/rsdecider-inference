@@ -119,7 +119,8 @@ curl localhost:3000/readyz                                 # → ready
 
 ### Getting the models
 
-Each model folder carries a `manifest.json` (size + SHA-256 of every file, written last by the export). Either export
+Each model folder carries a `manifest.json` (size + SHA-256 of every file, written last by the export; the export is
+built in a staging folder and moved in only after its checks pass, so a failed run leaves the folder as it was). Either export
 the models (step 1 above), or set `download` on a `[[models]]` entry to a base URL serving an exported folder
 (`<download>/manifest.json`, `<download>/model.onnx`, …) and let rsdecider fetch it:
 
