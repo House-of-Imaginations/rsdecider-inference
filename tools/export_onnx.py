@@ -10,6 +10,8 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
+import tempfile
 import types
 
 import numpy as np
@@ -162,6 +164,18 @@ def write_manifest(out):
         json.dump({"files": files}, f, indent=2)
 
 
+def publish(stage, final):
+    """Moves a finished export from `stage` into `final`. Old manifest and model.onnx go first and the new
+    model.onnx and manifest land last, so an interrupt mid-move leaves model.onnx missing (rsdecider reports
+    it and can re-download) rather than a manifest-less mix that passes as a legacy export."""
+    for name in ("manifest.json", "model.onnx"):
+        if os.path.exists(os.path.join(final, name)):
+            os.remove(os.path.join(final, name))
+    last = ["model.onnx", "manifest.json"]
+    for name in [n for n in sorted(os.listdir(stage)) if n not in last] + last:
+        os.replace(os.path.join(stage, name), os.path.join(final, name))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default="convaiinnovations/laya")
@@ -174,10 +188,19 @@ def main():
     args = ap.parse_args()
     if args.force and args.quantize is None:
         ap.error("--force only makes sense with --quantize")
-    os.makedirs(args.out, exist_ok=True)
-    manifest = os.path.join(args.out, "manifest.json")
-    if os.path.exists(manifest):  # never leave an old manifest beside a half-written new export
-        os.remove(manifest)
+    final = args.out
+    os.makedirs(final, exist_ok=True)
+    # Build the export in a staging folder inside the target (same filesystem, so the moves are renames; rsdecider
+    # only looks at top-level names). The live files and manifest stay untouched until the export has passed.
+    args.out = tempfile.mkdtemp(prefix=".export-", dir=final)
+    try:
+        export(args)
+        publish(args.out, final)
+    finally:
+        shutil.rmtree(args.out, ignore_errors=True)
+
+
+def export(args):
     torch.backends.mha.set_fastpath_enabled(False)  # fused MHA kernels are not exportable
 
     agent = laya.load(args.repo, device="cpu", subfolder=args.subfolder)
@@ -284,7 +307,7 @@ def main():
             if gate_failed and not args.force:
                 raise SystemExit(f"{args.quantize} decision gate failed: top-1 must match on every decisive "
                                   "question (reference top-2 margin > 0.10), |Δp| <= 0.05 and |Δ act_prob| <= 0.05 "
-                                  "on every question; kept the fp32 model.onnx (rerun with --force to override)")
+                                  "on every question; left the output folder unchanged (rerun with --force to override)")
             if gate_failed:
                 print(f"WARNING: {args.quantize} decision gate failed (see numbers above) but --force was given; "
                       "writing the quantized model.onnx anyway")
@@ -294,7 +317,7 @@ def main():
         # behind unless we clean it up here; a successful gate already moved it onto onnx_path.
         if check_path != onnx_path and os.path.exists(check_path):
             os.remove(check_path)
-    write_manifest(args.out)  # last: only a folder whose model.onnx is final gets a manifest
+    write_manifest(args.out)  # last: only an export that passed every check gets a manifest
 
 
 if __name__ == "__main__":
