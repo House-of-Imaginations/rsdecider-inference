@@ -1,5 +1,7 @@
 //! Real ONNX model vs fixtures from tools/export_onnx.py.
 //! Run: MODEL_DIR=models/english cargo test --release --features parity --test parity
+//! fp32 exports only: the 1e-3 threshold is fp32 parity; a `--quantize w8` folder is held to the looser export
+//! gate (|Δp| ≤ 0.05, near-tie flips allowed) instead, so it fails here by design.
 #![cfg(feature = "parity")]
 
 use rsdecider::lang;
