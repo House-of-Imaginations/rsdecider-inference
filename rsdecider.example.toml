@@ -48,6 +48,7 @@ redis_timeout_ms             = 250      # per Redis command; then cache miss / l
 idempotency_local_max_bytes  = 67108864 # in-process idempotency store (64 MiB)
 idempotency_max_stored_bytes = 262144   # larger responses re-run on repeat (256 KiB)
 # ort_global_threads          = 4       # one shared ORT intra-op pool for every session; per-model intra_op_threads then ignored
+# admission_headroom          = 0.8     # fraction of the remaining deadline admission may predict a request will fill
 
 # Generate: rsdecider hash-key <secret>
 [[keys]]

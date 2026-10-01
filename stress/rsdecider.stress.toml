@@ -52,6 +52,7 @@ redis_timeout_ms = 250
 idempotency_local_max_bytes = 67108864
 idempotency_max_stored_bytes = 262144
 # ort_global_threads = 4                # one shared ORT intra-op pool for every session; per-model intra_op_threads then ignored
+# admission_headroom = 0.8              # fraction of the remaining deadline admission may predict a request will fill
 
 [[keys]]
 name = "stress"

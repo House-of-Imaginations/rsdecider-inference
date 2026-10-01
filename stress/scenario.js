@@ -1,4 +1,5 @@
 // k6 run -e SCENARIO=cold|hot|mixed|batch|overload|tokenize -e RATE=20 stress/scenario.js (run.sh sets RATE per scenario)
+import exec from 'k6/execution';
 import { post, questions, state, bigState, zipf, ramp } from './lib.js';
 
 const S = __ENV.SCENARIO || 'mixed';
@@ -16,7 +17,10 @@ export const options = {
 };
 
 export default function () {
-  const i = __ITER + __VU * 1e6;
+  // A globally unique, monotonically increasing counter across the whole scenario. __ITER + __VU * 1e6 is
+  // not: 1e6 is divisible by 8, so state()'s `i % 8` language pick collapsed to __ITER alone, and at low
+  // rates with 200 pre-allocated VUs almost every VU sits at __ITER 0-2 (English), starving non-English mix.
+  const i = exec.scenario.iterationInTest;
   if (S === 'cold' || S === 'overload') post('/v1/decide', { state: state(i), questions: questions() });
   else if (S === 'hot') post('/v1/decide', { state: state(0), questions: questions() });
   else if (S === 'mixed') post('/v1/decide', { state: state(zipf(100000)), questions: questions() });

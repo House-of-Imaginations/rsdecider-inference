@@ -19,6 +19,9 @@ pub struct Knobs {
     /// the calling thread (n - 1 pool threads), and each concurrent Run also occupies its caller, so up to
     /// Σ workers + n - 1 threads compute at once.
     pub ort_global_threads: Option<usize>,
+    /// Fraction of the remaining deadline admission may predict a request will fill; the rest is headroom
+    /// for the batch-time scatter around the mean estimate.
+    pub admission_headroom: f64,
 }
 
 impl Default for Knobs {
@@ -30,6 +33,7 @@ impl Default for Knobs {
             idempotency_local_max_bytes: 64 << 20,
             idempotency_max_stored_bytes: 256 << 10,
             ort_global_threads: None,
+            admission_headroom: 0.8,
         }
     }
 }
@@ -48,6 +52,9 @@ impl Knobs {
             Some((k, _)) => Err(format!("knobs.{k} must be >= 1")),
             None if self.idempotency_max_stored_bytes as u64 > self.idempotency_local_max_bytes => {
                 Err("knobs.idempotency_max_stored_bytes exceeds knobs.idempotency_local_max_bytes".into())
+            }
+            None if !(self.admission_headroom > 0.0 && self.admission_headroom <= 1.0) => {
+                Err("knobs.admission_headroom must be in (0, 1]".into())
             }
             None => Ok(()),
         }
