@@ -1,4 +1,5 @@
 # Run from this folder: docker compose up --build
+# No models yet and no `download` URL? Once: docker compose --profile export up models-export
 services:
   redis:
     image: redis:7-alpine
@@ -8,11 +9,13 @@ services:
       context: ..
       dockerfile: self-hosted/Dockerfile
     depends_on: [redis]
+    # Dockerfile CMD plus --download-models: fetches missing models from their `download` URL on start.
+    command: ["serve", "--config", "/etc/rsdecider/rsdecider.toml", "--download-models"]
     ports: ["3000:3000", "127.0.0.1:9000:9000"]
     restart: unless-stopped
     stop_grace_period: 15s
     volumes:
-      - ../models:/models:ro
+      - ../models:/models
       - ./rsdecider.toml:/etc/rsdecider/rsdecider.toml:ro
   prometheus:
     image: prom/prometheus:v2.55.1
@@ -31,3 +34,29 @@ services:
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+  # Opt-in: docker compose --profile export up models-export. Exports only the models without a manifest.json (written last).
+  models-export:
+    image: python:3.11-slim
+    profiles: ["export"]
+    working_dir: /src
+    volumes:
+      - ../tools:/src/tools:ro
+      - ../models:/models
+      - hf-cache:/root/.cache/huggingface
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        need=""
+        [ -f /models/english/manifest.json ] || need="$$need english"
+        [ -f /models/multilingual/manifest.json ] || need="$$need multilingual"
+        if [ -z "$$need" ]; then echo "models present, nothing to export"; exit 0; fi
+        pip install --no-cache-dir -q --extra-index-url https://download.pytorch.org/whl/cpu -r tools/requirements.txt
+        for m in $$need; do
+          if [ "$$m" = english ]; then python tools/export_onnx.py --out /models/english
+          else python tools/export_onnx.py --subfolder multilingual --out /models/multilingual; fi
+        done
+
+volumes:
+  hf-cache:

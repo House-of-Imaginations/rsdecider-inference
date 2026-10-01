@@ -12,7 +12,7 @@ e2e = []
 [dependencies]
 arc-swap = "1.9.2"
 axum = "0.8.9"
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6", features = ["derive", "env"] }
 futures = "0.3.34"
 governor = "0.10.4"
 hex = "0.4"
@@ -21,6 +21,7 @@ metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 moka = { version = "0.12.16", features = ["sync"] }
 ort = "=2.0.0-rc.13"
 redis = { version = "1.7.0", features = ["tokio-comp", "connection-manager"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.11.0"
@@ -35,6 +36,5 @@ unicode-properties = { version = "0.1", default-features = false, features = ["g
 
 [dev-dependencies]
 http-body-util = "0.1"
-reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
 testcontainers-modules = { version = "0.15.0", features = ["redis"] }
 tower = { version = "0.5", features = ["util"] }

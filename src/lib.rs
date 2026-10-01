@@ -2,6 +2,7 @@ pub mod api;
 pub mod auth;
 pub mod cache;
 pub mod config;
+pub mod download;
 pub mod fake;
 pub mod idempotency;
 pub mod knobs;

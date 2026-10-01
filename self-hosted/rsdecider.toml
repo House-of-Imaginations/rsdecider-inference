@@ -10,10 +10,12 @@ non_english_model = "multilingual"
 [[models]]
 name = "english"
 path = "/models/english"
+# download = "https://huggingface.co/<org>/<repo>/resolve/<revision>/english"  # fill in to download on start (--download-models)
 
 [[models]]
 name = "multilingual"
 path = "/models/multilingual"
+# download = "https://huggingface.co/<org>/<repo>/resolve/<revision>/multilingual"  # fill in to download on start (--download-models)
 
 [cache]
 redis_url = "redis://redis:6379"

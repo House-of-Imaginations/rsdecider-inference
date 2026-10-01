@@ -6,3 +6,4 @@ skills-lock.json
 .superpowers/
 .venv/
 models/
+__pycache__/
