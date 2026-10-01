@@ -69,6 +69,7 @@ fn parse_manifest(raw: &[u8]) -> Result<Manifest, String> {
         return Err(format!("manifest.json: unexpected file name {name:?}"));
     }
     let has = |n: &str| m.files.contains_key(n);
+    // Which model file a provider needs is check()'s job (LEGACY / MLX_LEGACY); here, at least one.
     if !(has("tokenizer.json") && has("laya.json") && (has("model.onnx") || has("mlx.safetensors"))) {
         return Err("manifest.json: must list tokenizer.json, laya.json and model.onnx or mlx.safetensors".into());
     }
@@ -459,6 +460,15 @@ mod tests {
         }
         assert!(parse_manifest(manifest_for(&FILES[..2]).as_bytes()).is_err(), "laya.json is required");
         assert!(parse_manifest(manifest_for(&FILES[1..]).as_bytes()).is_err(), "a model file is required");
+        let mlx_only = manifest_for(&FILES[1..]).replacen(
+            "{\"files\": {",
+            "{\"files\": {\"mlx.safetensors\": {\"size\": 1, \"sha256\": \"00\"}, ",
+            1,
+        );
+        assert!(
+            parse_manifest(mlx_only.as_bytes()).is_ok(),
+            "an MLX-only folder is valid; check() enforces per provider"
+        );
     }
 
     fn model(download: Option<&str>) -> ModelCfg {
