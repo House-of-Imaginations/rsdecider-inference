@@ -20,7 +20,7 @@ non_english_model = "multilingual"
 name = "english"
 path = "models/english"   # model.onnx + tokenizer.json + laya.json (tools/export_onnx.py)
 # download = "https://huggingface.co/<org>/<repo>/resolve/<revision>/english"  # fill in once exports are published: `models pull` / first-run download
-execution_provider = "cpu" # or "cuda" (build with --features cuda)
+execution_provider = "cpu" # or "cuda" (--features cuda) or "mlx" (--features mlx, Apple Silicon)
 workers = 1               # ORT sessions, one per blocking thread
 intra_op_threads = 6
 # Size max_pending ≈ items/s × 1-2 s. It is a memory bound; latency is handled by admission, which
@@ -29,6 +29,14 @@ max_pending = 256         # queue bound in questions; beyond this → 529
 max_batch_items = 8
 max_batch_tokens = 8192
 max_wait_ms = 2
+
+# MLX on Apple Silicon (see README "Apple Silicon (MLX)"): export with --mlx, build with --features mlx.
+# [[models]]
+# name = "english-mlx"
+# path = "models/english"       # mlx.safetensors + mlx.json (tools/export_onnx.py --mlx)
+# execution_provider = "mlx"
+# mlx_dtype = "fp16"            # or "fp32"; fp16 is the default
+# workers = 1                   # MLX shares one GPU; more workers add memory, not throughput
 
 [[models]]
 name = "multilingual"
