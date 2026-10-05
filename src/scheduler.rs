@@ -738,7 +738,8 @@ mod tests {
         // A plain thread, not spawn_blocking: a hung start must not also hang runtime shutdown.
         std::thread::spawn(move || {
             let _rt = rt.enter();
-            let _ = tx.send(Scheduler::start(vec![spec], cache).err());
+            let _ =
+                tx.send(Scheduler::start(vec![spec], cache, crate::knobs::Knobs::default().admission_headroom).err());
         });
         let err = rx.recv_timeout(Duration::from_secs(5)).expect("start hung").expect("start succeeded");
         assert!(err.contains("worker exited during startup"), "{err}");
