@@ -420,7 +420,7 @@ fn worker(ctx: WorkerCtx, ready: std_mpsc::Sender<Result<(), String>>) {
                 metrics::counter!("rsdecider_padded_tokens_total", "model" => ctx.name.clone())
                     .increment((items.len() * longest) as u64);
                 let x = batch_secs / real_tokens.max(1) as f64;
-                let _ = ctx.secs_per_token.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+                let _ = ctx.secs_per_token.try_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
                     let old = f64::from_bits(b);
                     Some(if old == 0.0 { x } else { 0.8 * old + 0.2 * x }.to_bits())
                 });
@@ -738,7 +738,8 @@ mod tests {
         // A plain thread, not spawn_blocking: a hung start must not also hang runtime shutdown.
         std::thread::spawn(move || {
             let _rt = rt.enter();
-            let _ = tx.send(Scheduler::start(vec![spec], cache).err());
+            let _ =
+                tx.send(Scheduler::start(vec![spec], cache, crate::knobs::Knobs::default().admission_headroom).err());
         });
         let err = rx.recv_timeout(Duration::from_secs(5)).expect("start hung").expect("start succeeded");
         assert!(err.contains("worker exited during startup"), "{err}");
