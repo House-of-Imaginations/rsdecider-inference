@@ -420,7 +420,7 @@ fn worker(ctx: WorkerCtx, ready: std_mpsc::Sender<Result<(), String>>) {
                 metrics::counter!("rsdecider_padded_tokens_total", "model" => ctx.name.clone())
                     .increment((items.len() * longest) as u64);
                 let x = batch_secs / real_tokens.max(1) as f64;
-                let _ = ctx.secs_per_token.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+                let _ = ctx.secs_per_token.try_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
                     let old = f64::from_bits(b);
                     Some(if old == 0.0 { x } else { 0.8 * old + 0.2 * x }.to_bits())
                 });
